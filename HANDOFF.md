@@ -1,0 +1,33 @@
+# OCR API HANDOFF
+Updated: 2026-10-09
+
+## Facts
+- Service: `mac-ocr-http`. A load test with 2 workers held about 12 img/s, with RSS on a plateau and a full queue returning 503.
+- Listens on **127.0.0.1:8741** and an optional LAN address such as **192.168.1.50** (`OCR_HTTP_HOST`, comma list; 127/8 + RFC1918 only, 0.0.0.0/public refused). Missing address at start → one stderr line, retried every 30s, others keep serving. Reserve the machine's IP in the router. Token file `~/Library/Application Support/MacOcrHttp/token` (mode `0600`). LaunchAgent label defaults to `com.example.mac-ocr-http` (`OCR_HTTP_LABEL` overrides it, so an existing install can keep its current label). `scripts/install.sh` uses `swift build -c release --build-system native`.
+- No silent long-edge shrink of the tile path. Default `scale=auto`: one probe pass, downscaled to a long side of at most **4096** when the image is larger. Tile the original bitmap when glyph size / long side is below `OCR_HTTP_TILE_MIN_GLYPH_FRAC` (default **0.012**), or when that probe found fewer than 8 lines with at least 3 width units. A long side of at most **2048** is one pass. `force=whole` or `force=tile` overrides the choice. `scale=none` is the old grid (tile when either side exceeds 2048, no probe). `scale=tile` forces the grid. `scale=downscale` uses `OCR_HTTP_MAX_PIXEL` (default 4096) or request `maxPixel` (1024–8192) and scales boxes back. Tiles are serial inside one worker. The response reports `glyphPx`, `glyphFrac`, and `tileDecision`. `OCR_HTTP_TILE_MIN_TEXT_FRAC` is a deprecated alias of the glyph threshold.
+- Dedupe drops a fragment only when the boxes coincide (IoU ≥ 0.5, smaller box ≥ 80% covered, or same band and x-overlap ≥ 80% of the narrower width) and the match keys then agree. A ~256px tile seam on a long fragment does not coincide, so both fragments stay and are stitched. Match key: NFKC, strip Unicode whitespace, `lowercased()`, computed once. Keys agree when equal, when the shorter (≥ 4 characters) is contained in the longer, or when Levenshtein similarity ≥ 0.85. Keep the longer text when one contains the other, else higher confidence.
+- Tile tag: observations fully inside a non-overlap interior are never deduped against each other. Observations with ≥ 80% of their extent inside the same overlap strip keep the copy whose center is farther from its own tile's seam edge.
+- Default languages are `zh-Hans`, `en-US`. The response `languages` is the list read back from `VNRecognizeTextRequest` after `automaticallyDetectsLanguage = false`, plus `revision`. `script=hans` (the default when `zh-Hans` is first and `zh-Hant` was not requested) converts with `CFStringTransform` `Hant-Hans`, then the shinjitai table. An explicit `zh-Hant` request does not convert.
+- One visual row is one `text` line. Recursive XY-cut: full-width whitespace ≥ 1× median height (exact y intervals) splits top to bottom, then columns. A column boundary is three consecutive per-row gaps (each ≥ 1× median, shared overlap ≥ 0.5×, median width ≥ 1.5×) grown while that x stays empty. Projection gutters remain 1.5× median over a 3-line window. A no-gutter window does not glue lines. Columns read left to right. A box that crosses a gutter ends that band. A gap from the running right edge splits a row when it is > 2× median height, unless the fragments come from different tiles and one was cropped by its own tile edge (`max(8, min(24, 0.5×median))` px). A detected gutter splits anyway. Touching or overlapping fragments stay together. Overlapping x is trimmed by character width, then a normalized suffix/prefix of 2–6 characters. A single-tile image skips dedupe. `script=hans` then applies the shinjitai table (kana unchanged). `layout=document` stays opt-in: on a tilted multi-column page it was faster (about 1.2s against 3.7s) with better paragraph order but worse text (1839 vs about 3100 characters, 21 kana). `OCR_HTTP_QUEUE_TIMEOUT_MS` default **180000**.
+- `OCR_HTTP_MAX_PIXELS` default **100000000** (clamp 1e6–2e8). Over the cap, before decode: `413` `{"ok":false,"error":"image too large","maxPixels":...,"width":...,"height":...}`. `OCR_HTTP_VISION_WORKERS` default **2**.
+- Response includes `scale`, `tiles`, `lines`, and `rows`. `text` equals `rows` joined by newlines. `width`/`height` and every box are original oriented pixels. `GET /health` is open; `/stats`, `/languages`, `/ocr` are Bearer on every address.
+- Fixture: `swift scripts/gen-large-fixture.swift` → `fixtures/large-ocr.png` (7000×5000, not committed) and `fixtures/large-ocr.txt`. Score with `python3 scripts/eval_large.py --runs 1 --modes none fixtures/large-ocr.png` (recall is against `rows`).
+
+## Blockers
+1. Reinstall before the next OCR measurement. The height-based `scale=auto` rule was rejected: a failing whole pass returns a few merged boxes, so the box height goes up. The rule is glyph size / long side, T = 0.012. A long side of at most 4096 is not an automatic whole pass. Glyphs of about 56px on a 4032px long side stay one pass; glyphs of about 42px on a 5712px long side tile. The 7000/8400 fixtures tile because the probe returns no lines. A 3024×4032 page with small glyphs still tiles.
+2. In-flight Vision is not cancelled when the client drops.
+3. A 7000×5000 page is 12 tiles (4×3), slower than the old 4096 shrink. Tile size is a constant, not an env var.
+
+## Next
+1. On the Mac: `DEVELOPER_DIR=/Library/Developer/CommandLineTools OCR_HTTP_HOST=127.0.0.1,192.168.1.50 ./scripts/install.sh` (workers default 2). Set `OCR_HTTP_LABEL` when the machine already has a LaunchAgent under a different label. Use `$HOME`, not a hardcoded user path.
+2. `curl -sS http://127.0.0.1:8741/health` → `{"ok":true}`. Use `127.0.0.1`, not `localhost`. `./scripts/smoke.sh` still allows 500 on `fixtures/tiny.png`.
+3. `lsof -nP -iTCP:8741 -sTCP:LISTEN` must show exactly the `OCR_HTTP_HOST` addresses, never `*:8741`. Logs: `~/Library/Logs/MacOcrHttp/`.
+
+## Layout
+- `Sources/MacOcrHttp/HTTP` server (per-address listeners), admission queue, parser. `Auth/BearerAuth.swift`. `OCR/{ImageDecoding,Geometry,OCREngine,Tiling,VisionRuntime}.swift`. `Config.swift`, `main.swift`. `Sources/LineMergeCore` is Foundation-only (dedupe and rows). `swift run mac-ocr-line-merge-tests` (XCTest is not in the Command Line Tools).
+- `install/com.example.mac-ocr-http.plist` placeholders only. `scripts/install.sh`, `uninstall.sh`, `smoke.sh`, `gen-large-fixture.swift`, `eval_large.py`.
+
+## Gaps
+- No mid-request cancel. Tile length and overlap are fixed at 2048 and 256.
+- HTTP subset: origin-form, `Content-Length` only, one request per connection. Chunked bodies get `400`.
+- `elapsedMs` is decode plus every tile, not queue wait.

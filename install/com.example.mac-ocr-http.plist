@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>__LABEL__</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__BINARY__</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>__WORKDIR__</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>2</integer>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>OCR_HTTP_TOKEN</key>
+		<string>__TOKEN__</string>
+		<key>OCR_HTTP_HOST</key>
+		<string>__HOST__</string>
+		<key>OCR_HTTP_PORT</key>
+		<string>__PORT__</string>
+		<key>OCR_HTTP_VISION_WORKERS</key>
+		<string>__VISION_WORKERS__</string>
+		<key>OCR_HTTP_QUEUE_MAX</key>
+		<string>__QUEUE_MAX__</string>
+		<key>OCR_HTTP_QUEUE_TIMEOUT_MS</key>
+		<string>__QUEUE_TIMEOUT_MS__</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>__STDOUT__</string>
+	<key>StandardErrorPath</key>
+	<string>__STDERR__</string>
+</dict>
+</plist>

@@ -1,0 +1,596 @@
+#if canImport(LineMergeCore)
+import LineMergeCore
+#endif
+import Foundation
+
+private func line(
+    _ text: String,
+    _ x: Double,
+    _ y: Double,
+    _ w: Double,
+    _ h: Double,
+    _ confidence: Double
+) -> OCRLine {
+    OCRLine(
+        text: text,
+        confidence: confidence,
+        bbox: BBox(x: x, y: y, width: w, height: h),
+        quad: Quad(
+            topLeft: Point(x: x, y: y),
+            topRight: Point(x: x + w, y: y),
+            bottomRight: Point(x: x + w, y: y + h),
+            bottomLeft: Point(x: x, y: y + h)
+        )
+    )
+}
+
+private func check(_ condition: Bool, _ message: String) {
+    if !condition {
+        fputs("FAIL \(message)\n", stderr)
+        exit(1)
+    }
+}
+
+@main
+enum LineMergeTestMain {
+    static func main() {
+        run()
+        fputs("line-merge tests ok\n", stdout)
+    }
+}
+
+private func run() {
+    let yuan = LineMerge.matchKey("100 元")
+    check(yuan == LineMerge.matchKey("100元"), "spaces \(yuan)")
+    check(yuan == LineMerge.matchKey("１００元"), "fullwidth \(LineMerge.matchKey("１００元"))")
+    check(yuan == LineMerge.matchKey("100\n元"), "newline")
+    check(LineMerge.matchKey("Invoice") == LineMerge.matchKey("invoice"), "case")
+
+    let spaced = LineMerge.assemble([
+        line("100 元", 0, 0, 80, 16, 0.95),
+        line("100元", 0, 0, 80, 16, 0.40),
+    ])
+    check(spaced.lines.count == 1, "whitespace dup lines \(spaced.lines.count)")
+    check(spaced.lines[0].text == "100 元", "kept higher confidence spelling \(spaced.lines[0].text)")
+    check(spaced.rows.count == 1 && spaced.text == "100 元", "whitespace dup row \(spaced.text)")
+
+    let phrase = "发票金额 Invoice 100 元 END"
+    let repeated = LineMerge.assemble([
+        line(phrase, 0, 0, 800, 18, 0.9),
+        line(phrase, 0, 40, 800, 18, 0.9),
+    ])
+    check(repeated.lines.count == 2 && repeated.rows.count == 2, "different rows \(repeated.lines.count) \(repeated.rows.count)")
+    check(repeated.text == "\(phrase)\n\(phrase)", "repeated text \(repeated.text)")
+
+    let columns = LineMerge.assemble([
+        line("Right", 200, 0, 40, 16, 0.9),
+        line("Left", 0, 0, 40, 16, 0.9),
+    ])
+    check(columns.rows.count == 2 && columns.text == "Left\nRight", "columns \(columns.text)")
+
+    check(shinjitaiToSimplified("発気満対実") == "发气满对实", "shinjitai \(shinjitaiToSimplified("発気満対実"))")
+    check(shinjitaiToSimplified("あア発") == "あア发", "kana left alone \(shinjitaiToSimplified("あア発"))")
+    check(shinjitaiToSimplified("浄済") == "净济", "浄済 \(shinjitaiToSimplified("浄済"))")
+
+    seamStitch()
+    stripDuplicate()
+    touchingFragments()
+    coveredSeamScrap()
+    seamGapStays()
+    gutterBeatsSeam()
+    timing()
+    fixturePages()
+    columnReadingOrder()
+    stackedParagraphCenter()
+    tilePolicy()
+}
+
+/// Two ~2000px fragments of one repetitive row, sharing only the 256px tile overlap.
+/// The normalized texts are similar enough that a loose x-overlap rule would drop one.
+private func seamStitch() {
+    let piece = "发票金额 Invoice 100 元 "
+    let leftText = "L001 " + String(repeating: piece, count: 6)
+    let rightText = String(repeating: piece, count: 6) + "E001"
+    let leftTile = TileFrame(x: 0, y: 0, width: 2048, height: 2048)
+    let rightTile = TileFrame(x: 1792, y: 0, width: 2048, height: 2048)
+    let page = LineMerge.assemble(
+        [
+            line(leftText, 40, 40, 2000, 16, 0.5),
+            line(rightText, 1800, 40, 2000, 16, 0.5),
+        ],
+        tiles: [leftTile, rightTile]
+    )
+    check(page.lines.count == 2, "seam kept both fragments \(page.lines.count)")
+    check(page.rows.count == 1, "seam one row \(page.rows.count) \(page.text)")
+    let row = page.rows[0].text
+    check(row.contains("L001"), "seam missing L001 \(row)")
+    check(row.contains("E001"), "seam missing E001 \(row)")
+    check(row.components(separatedBy: "L001").count == 2, "L001 once \(row)")
+    check(row.components(separatedBy: "E001").count == 2, "E001 once \(row)")
+    let token = LineMerge.matchKey(piece)
+    let key = LineMerge.matchKey(row)
+    var count = 0
+    var search = key.startIndex
+    while let range = key.range(of: token, range: search..<key.endIndex) {
+        count += 1
+        search = range.upperBound
+    }
+    // Geometry keeps the part of the right box past the 240px overlap.
+    // The synthetic text repeats the phrase across that uncovered span, so the
+    // count is 11 rather than 6. E001 is still on the row, and the overlap
+    // itself is not a second full copy (12).
+    check(count == 11, "overlap phrase count \(count) in \(row)")
+    check(count < 12, "overlap was not trimmed \(count)")
+}
+
+/// Same whitespace-only text inside the overlap strip. Keep the copy farther from its tile edge.
+private func stripDuplicate() {
+    let leftTile = TileFrame(x: 0, y: 0, width: 2048, height: 2048)
+    let rightTile = TileFrame(x: 1792, y: 0, width: 2048, height: 2048)
+    let page = LineMerge.assemble(
+        [
+            line("100元", 1820, 10, 80, 16, 0.99),
+            line("100 元", 1800, 10, 80, 16, 0.5),
+        ],
+        tiles: [rightTile, leftTile]
+    )
+    check(page.lines.count == 1, "strip dup lines \(page.lines.count) \(page.text)")
+    check(page.lines[0].text == "100 元", "kept the copy farther from the seam \(page.lines[0].text)")
+}
+
+/// A short fragment nested inside a longer one must not open a column gap.
+/// The next fragment touches the long box, so the running right edge is what counts.
+private func touchingFragments() {
+    let page = LineMerge.group([
+        line("RIGHT", 500, 0, 200, 20, 0.9),
+        line("岁", 400, 0, 20, 20, 0.9),
+        line("LEFT", 0, 0, 500, 20, 0.9),
+    ])
+    check(page.rows.count == 1, "touching fragments one row \(page.rows.count) \(page.text)")
+    check(page.text.contains("LEFT") && page.text.contains("RIGHT"), "kept both ends \(page.text)")
+    check(!page.text.contains("岁"), "covered scrap dropped \(page.text)")
+
+    let columns = LineMerge.group([
+        line("LEFT", 0, 40, 40, 20, 0.9),
+        line("RIGHT", 200, 40, 40, 20, 0.9),
+    ])
+    check(columns.rows.count == 2 && columns.text == "LEFT\nRIGHT", "real column gap \(columns.text)")
+}
+
+/// A whitespace gap inside the overlap strip splits when neither box was cropped.
+/// A box that ends on its tile edge stays with the fragment from the next tile.
+private func seamGapStays() {
+    let leftTile = TileFrame(x: 0, y: 0, width: 2048, height: 2048)
+    let rightTile = TileFrame(x: 1792, y: 0, width: 2048, height: 2048)
+    let open = LineMerge.assemble(
+        [
+            line("LEFT", 1600, 0, 200, 16, 0.9),
+            line("RIGHT", 1860, 0, 200, 16, 0.9),
+        ],
+        tiles: [leftTile, rightTile]
+    )
+    check(open.rows.count == 2, "unclipped overlap gap stayed joined \(open.rows.count) \(open.text)")
+
+    let clipped = LineMerge.assemble(
+        [
+            line("LEFT", 1848, 0, 200, 16, 0.9),
+            line("RIGHT", 2110, 0, 200, 16, 0.9),
+        ],
+        tiles: [leftTile, rightTile]
+    )
+    check(clipped.rows.count == 1, "clipped seam split \(clipped.rows.count) \(clipped.text)")
+    check(clipped.text.contains("LEFT") && clipped.text.contains("RIGHT"), "clipped seam text \(clipped.text)")
+}
+
+/// A real column gutter splits even when the right fragment starts on its tile edge.
+private func gutterBeatsSeam() {
+    let leftTile = TileFrame(x: 0, y: 0, width: 2048, height: 400)
+    let rightTile = TileFrame(x: 1792, y: 0, width: 2048, height: 400)
+    var lines: [OCRLine] = []
+    var tiles: [TileFrame?] = []
+    for row in 0..<3 {
+        let y = Double(row) * 30
+        lines.append(line("L\(row)", 400, y, 300, 20, 0.9))
+        tiles.append(leftTile)
+        lines.append(line("R\(row)", 1792, y, 300, 20, 0.9))
+        tiles.append(rightTile)
+    }
+    let page = LineMerge.assemble(lines, tiles: tiles)
+    check(page.rows.count >= 3, "gutter rows \(page.rows.count) \(page.text)")
+    for row in page.rows {
+        let hasL = row.text.contains("L")
+        let hasR = row.text.contains("R")
+        check(!(hasL && hasR), "gutter lost to seam \(row.text)")
+    }
+}
+
+/// "ce 100元" sits in the overlap; "TAIL" is past the left box and must survive.
+private func coveredSeamScrap() {
+    let page = LineMerge.group([
+        line("发票金额 Invoice 100 元 END", 0, 0, 300, 20, 0.9),
+        line("ce 100元 TAIL", 200, 0, 180, 20, 0.9),
+    ])
+    check(page.rows.count == 1, "seam scrap one row \(page.rows.count)")
+    check(page.text.contains("TAIL"), "uncovered tail kept \(page.text)")
+    check(!page.text.contains("ce 100元"), "seam prefix dropped \(page.text)")
+    check(page.text.contains("END"), "left text kept \(page.text)")
+}
+
+private struct FixtureLine: Decodable {
+    var text: String
+    var x: Double
+    var y: Double
+    var w: Double
+    var h: Double
+}
+
+private func fixturePages() {
+    let pages: [(String, Int, Double, Double)] = [
+        ("page-7000.json", 223, 7000, 5000),
+        ("page-8400.json", 269, 8400, 6000),
+    ]
+    for (name, gt, width, height) in pages {
+        let url = fixtureURL(name)
+        check(url != nil, "missing fixture \(name)")
+        let data = try! Data(contentsOf: url!)
+        let decoded = try! JSONDecoder().decode([FixtureLine].self, from: data)
+        let lines = decoded.map { item in
+            line(item.text, item.x, item.y, item.w, item.h, 0.5)
+        }
+        let page = LineMerge.group(lines, tiles: assignTiles(lines, width: width, height: height))
+        let ratio = Double(page.rows.count) / Double(gt)
+        fputs("fixture \(name) rows \(page.rows.count) gt \(gt) ratio \(String(format: "%.4f", ratio))\n", stdout)
+        check(ratio >= 0.98 && ratio <= 1.03, "\(name) rows \(page.rows.count) vs gt \(gt)")
+        check(page.text == page.rows.map(\.text).joined(separator: "\n"), "\(name) text matches rows")
+        for marker in ["L159", "L160", "L134", "L150", "L164"] {
+            let hits = page.rows.filter { $0.text.contains(marker) }
+            check(hits.count == 1, "\(name) \(marker) rows \(hits.count)")
+            let end = marker.replacingOccurrences(of: "L", with: "E")
+            check(hits[0].text.contains(end), "\(name) \(marker) split from \(end) \(hits[0].text.prefix(40))")
+        }
+        let blob = page.text
+        check(!blob.contains(". ce"), "\(name) seam '. ce'")
+        check(!blob.contains("： e"), "\(name) seam '： e'")
+        check(!blob.contains("元 . ce"), "\(name) seam '元 . ce'")
+        check(!blob.contains("元. ce"), "\(name) seam '元. ce'")
+        let dups = duplicateMarkerCount(blob)
+        fputs("fixture \(name) duplicate markers \(dups)\n", stdout)
+        check(dups <= 1, "\(name) duplicate markers \(dups)")
+        fputs("fixture \(name) blocks \(page.blocks.count)\n", stdout)
+        check(page.blocks.count == 1, "\(name) blocks \(page.blocks.count)")
+        let heights = lines.map(\.bbox.height).sorted()
+        let columnBasis = heights.isEmpty ? 16.0 : heights[heights.count / 2]
+        for leftIndex in page.blocks.indices {
+            for rightIndex in (leftIndex + 1)..<page.blocks.count {
+                let leftBox = page.blocks[leftIndex].bbox
+                let rightBox = page.blocks[rightIndex].bbox
+                let overlap = min(leftBox.y + leftBox.height, rightBox.y + rightBox.height) - max(leftBox.y, rightBox.y)
+                let xGap = max(leftBox.x, rightBox.x) - min(leftBox.x + leftBox.width, rightBox.x + rightBox.width)
+                check(!(overlap > columnBasis * 3 && xGap > 0), "\(name) split into columns")
+            }
+        }
+        if let dir = ProcessInfo.processInfo.environment["LINE_MERGE_DUMP"] {
+            let out = URL(fileURLWithPath: dir).appendingPathComponent(name.replacingOccurrences(of: ".json", with: "-rows.json"))
+            let payload = try! JSONSerialization.data(withJSONObject: page.rows.map(\.text))
+            try! payload.write(to: out)
+        }
+    }
+}
+
+/// Three synthetic columns, two bands. An oversized title covers the subtitle's
+/// box, but the centers are more than a line apart, so the subtitle stays.
+/// A contained copy and a two-character scrap fold back into their host rows.
+private func columnReadingOrder() {
+    var lines: [OCRLine] = []
+    lines.append(line("Quarterly progress on the sample inventory report", 60, 20, 2000, 220, 0.9))
+    lines.append(line("Notes on the current quarter and the open items", 200, 180, 800, 36, 0.9))
+    let columns = [
+        ("Left", 80.0),
+        ("Middle", 900.0),
+        ("Right", 2100.0),
+    ]
+    for band in [480.0, 980.0] {
+        for row in 0..<4 {
+            let y = band + Double(row) * 48
+            for column in columns {
+                let text = "\(column.0) row \(row) stays in its own column"
+                lines.append(line(text, column.1, y, 420, 36, 0.9))
+            }
+        }
+    }
+    lines.append(line("Restock the north aisle before the noon delivery", 200, 1500, 900, 40, 0.9))
+    lines.append(line("north aisle before the noon", 250, 1502, 520, 36, 0.5))
+    lines.append(line("Deliver the spare parts to the service counter today", 200, 1620, 900, 40, 0.9))
+    lines.append(line("zz", 500, 1624, 24, 28, 0.4))
+
+    let page = LineMerge.group(lines, tiles: assignTiles(lines, width: 3000, height: 1800))
+    check(page.text == page.rows.map(\.text).joined(separator: "\n"), "column text matches rows")
+    let first = page.rows.first?.text ?? ""
+    check(first.contains("Quarterly progress"), "title is not first \(first)")
+    let notes = page.rows.filter { $0.text.contains("Notes on the current quarter") }
+    check(notes.count == 1, "subtitle rows \(notes.count)")
+    check(!first.contains("Notes on the current quarter"), "title absorbed the subtitle \(first)")
+
+    let heights = page.lines.map(\.bbox.height).sorted()
+    let basis = heights.isEmpty ? 16.0 : heights[heights.count / 2]
+    for block in page.blocks {
+        var previous = -Double.greatestFiniteMagnitude
+        for index in block.rowIndices {
+            let box = page.rows[index].bbox
+            let center = box.y + box.height / 2
+            check(center + basis >= previous, "block y went backwards \(center) after \(previous)")
+            previous = center
+        }
+    }
+    for row in page.rows {
+        let hasMiddle = row.text.contains("Middle")
+        let hasRight = row.text.contains("Right")
+        let hasLeft = row.text.contains("Left")
+        check(!(hasMiddle && hasRight), "middle and right share a row \(row.text)")
+        check(!(hasLeft && hasMiddle), "left bled into the middle \(row.text)")
+    }
+    func bandIndices(_ name: String, y0: Double, y1: Double) -> [Int] {
+        page.rows.indices.filter { index in
+            let row = page.rows[index]
+            let box = row.bbox
+            let centerY = box.y + box.height / 2
+            return row.text.contains(name) && centerY >= y0 && centerY <= y1
+        }
+    }
+    for band in [(480.0, 720.0, "upper"), (980.0, 1220.0, "lower")] {
+        let middle = bandIndices("Middle", y0: band.0, y1: band.1)
+        let right = bandIndices("Right", y0: band.0, y1: band.1)
+        check(!middle.isEmpty && !right.isEmpty, "column band empty \(band.2)")
+        if let lastMiddle = middle.max(), let firstRight = right.min() {
+            check(lastMiddle < firstRight, "middle column is not finished before the right column \(band.2) \(lastMiddle) \(firstRight)")
+        }
+        for block in page.blocks {
+            let hasMiddle = block.rowIndices.contains { middle.contains($0) }
+            let hasRight = block.rowIndices.contains { right.contains($0) }
+            check(!(hasMiddle && hasRight), "middle and right share block \(band.2)")
+        }
+    }
+    let restock = page.rows.filter { $0.text.contains("Restock the north aisle") }
+    check(restock.count == 1, "contained copy stayed a second row \(restock.map(\.text))")
+    let orphan = page.rows.filter { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) == "zz" }
+    check(orphan.isEmpty, "short scrap stayed a row \(orphan.map(\.text))")
+}
+
+/// Tall boxes overlap by about half a line while their centers are still
+/// farther than 0.5× the median height. They stay two rows, so the lower
+/// line keeps its left half.
+private func stackedParagraphCenter() {
+    var lines: [OCRLine] = []
+    for index in 0..<12 {
+        lines.append(line(
+            "Filler sentence \(index) sets the median line height",
+            200,
+            100 + Double(index) * 200,
+            900,
+            138,
+            0.9
+        ))
+    }
+    let body = "FLOOR stays on this line. " + String(repeating: "The sample paragraph continues across the measure. ", count: 6) + "PERIOD ends the review."
+    lines.append(line("ALPHA plan covers the sample tier only", 242.75, 3097.45, 1630.92, 182.42, 0.9))
+    lines.append(line(body, 247.65, 3177.74, 2723.22, 272.17, 0.9))
+    let whole = LineMerge.group(lines)
+    let floor = whole.rows.filter { $0.text.contains("FLOOR") }
+    check(floor.count == 1, "whole floor rows \(floor.count) \(floor.map(\.text))")
+    if let row = floor.first {
+        check(row.text.contains("PERIOD"), "whole line lost its right half \(row.text)")
+        check(!row.text.contains("ALPHA"), "heading swallowed the paragraph \(row.text)")
+    }
+    let heading = whole.rows.filter { $0.text.contains("ALPHA") }
+    check(heading.count == 1, "heading rows \(heading.count)")
+    check(heading.first?.text.contains("PERIOD") == false, "heading took the paragraph \(heading.first?.text ?? "")")
+
+    var tiled = lines
+    tiled.removeLast()
+    let right = String(repeating: "word ", count: 20) + "MARKRIGHT through the review period ends here"
+    tiled.append(line("MARKLEFT begins the sample paragraph and reaches the seam", 248.8, 3243.0, 1800.1, 187.9, 0.9))
+    tiled.append(line(right, 972.0, 3182.4, 1990.6, 214.5, 0.9))
+    let tiledPage = LineMerge.group(tiled, tiles: assignTiles(tiled, width: 3024, height: 4032))
+    let marked = tiledPage.rows.filter { $0.text.contains("MARKLEFT") }
+    check(marked.count == 1, "tiled paragraph rows \(marked.count) \(marked.map(\.text))")
+    if let row = marked.first {
+        check(row.text.contains("MARKRIGHT"), "tiled paragraph lost its right half \(row.text)")
+        check(!row.text.contains("ALPHA"), "tiled heading joined the paragraph \(row.text)")
+    }
+    let scheme = tiledPage.rows.filter { $0.text.contains("ALPHA") }
+    check(scheme.count == 1, "tiled heading rows \(scheme.count)")
+    check(scheme.first?.text.contains("MARKRIGHT") == false, "tiled heading took the next line \(scheme.first?.text ?? "")")
+}
+
+private func duplicateMarkerCount(_ text: String) -> Int {
+    var counts: [String: Int] = [:]
+    let chars = Array(text)
+    var index = 0
+    while index < chars.count {
+        let character = chars[index]
+        if character == "L" || character == "E" {
+            var end = index + 1
+            while end < chars.count, let value = chars[end].asciiValue, (48...57).contains(value) {
+                end += 1
+            }
+            if end - index - 1 >= 3 {
+                let marker = String(chars[index..<end])
+                counts[marker, default: 0] += 1
+            }
+        }
+        index += 1
+    }
+    return counts.values.filter { $0 >= 2 }.count
+}
+
+private func tilePolicy() {
+    check(TilePolicy.defaultMinGlyphFrac == 0.012, "default T \(TilePolicy.defaultMinGlyphFrac)")
+    check(TilePolicy.probeMaxSide == 4096, "probe side \(TilePolicy.probeMaxSide)")
+    check(TilePolicy.singlePassSide == 2048, "single pass \(TilePolicy.singlePassSide)")
+    check(abs(TilePolicy.widthUnits("，") - 1) < 0.001, "fullwidth comma")
+    check(abs(TilePolicy.widthUnits("A") - 0.55) < 0.001, "latin unit")
+    check(abs(TilePolicy.widthUnits("中A") - 1.55) < 0.001, "mixed units")
+
+    let wide = glyphRun(count: 16, chars: 10, px: 56)
+    let page = TilePolicy.decide(width: 3024, height: 4032, lines: wide)
+    fputs("wide decision \(page.mode) \(page.glyphPx) \(page.glyphFrac) \(page.tileDecision)\n", stdout)
+    check(page.mode == "whole", "56px glyphs on a 4032 page should be whole \(page.tileDecision)")
+    check(!page.tileDecision.contains("4096"), "4032 must not skip on long side \(page.tileDecision)")
+    check(abs(page.glyphPx - 56) < 0.05, "wide glyphPx \(page.glyphPx)")
+    check(page.glyphFrac >= 0.012, "wide glyphFrac \(page.glyphFrac)")
+    check(page.countedLines >= 8, "wide counted \(page.countedLines)")
+
+    let phone = TilePolicy.decide(width: 3024, height: 4032, lines: glyphRun(count: 10, chars: 10, px: 40))
+    check(phone.mode == "tiled", "small glyphs on a 4032 page still tile \(phone.tileDecision)")
+    check(!phone.tileDecision.contains("4096"), "no 4096 shortcut \(phone.tileDecision)")
+
+    let dense = TilePolicy.decide(width: 4284, height: 5712, lines: glyphRun(count: 12, chars: 10, px: 42))
+    fputs("dense decision \(dense.mode) \(dense.glyphPx) \(dense.glyphFrac) \(dense.tileDecision)\n", stdout)
+    check(dense.mode == "tiled", "42px glyphs on a 5712 page \(dense.tileDecision)")
+    check(abs(dense.glyphPx - 42) < 0.05, "dense glyphPx \(dense.glyphPx)")
+    check(dense.glyphFrac < 0.012, "dense frac \(dense.glyphFrac)")
+
+    let emptyWide = TilePolicy.decide(width: 7000, height: 5000, lines: [])
+    check(emptyWide.mode == "tiled" && emptyWide.tileDecision.contains("qualifying"), emptyWide.tileDecision)
+    let emptyTaller = TilePolicy.decide(width: 8400, height: 6000, lines: [])
+    check(emptyTaller.mode == "tiled", "8400 fixture \(emptyTaller.tileDecision)")
+
+    let junk = TilePolicy.decide(width: 6064, height: 8294, lines: glyphRun(count: 4, chars: 8, px: 400))
+    check(junk.mode == "tiled" && junk.countedLines == 4, "halftone \(junk.tileDecision)")
+    check(junk.glyphFrac > 0.012, "halftone fraction would have looked large \(junk.glyphFrac)")
+
+    let oneTile = TilePolicy.decide(width: 1500, height: 2048, lines: glyphRun(count: 10, chars: 8, px: 10))
+    check(oneTile.mode == "whole" && oneTile.tileDecision.contains("2048"), oneTile.tileDecision)
+    let justOver = TilePolicy.decide(width: 1500, height: 2049, lines: glyphRun(count: 10, chars: 8, px: 10))
+    check(justOver.mode == "tiled", "2049 still measured \(justOver.tileDecision)")
+
+    let forcedTile = TilePolicy.decide(width: 3024, height: 4032, lines: wide, force: "tile")
+    check(forcedTile.mode == "tiled" && forcedTile.tileDecision == "tiled: force=tile", forcedTile.tileDecision)
+    check(abs(forcedTile.glyphPx - 56) < 0.05, "force still reports glyph \(forcedTile.glyphPx)")
+    let forcedWhole = TilePolicy.decide(width: 7000, height: 5000, lines: [], force: "whole")
+    check(forcedWhole.mode == "whole" && forcedWhole.tileDecision == "whole: force=whole", forcedWhole.tileDecision)
+}
+
+private func glyphRun(count: Int, chars: Int, px: Double) -> [GlyphBox] {
+    let text = String(repeating: "中", count: chars)
+    return (0..<count).map { _ in GlyphBox(text: text, width: px * Double(chars)) }
+}
+
+private func tileRects(width: Double, height: Double) -> [TileFrame] {
+    let tile = 2048.0
+    let overlap = 256.0
+    func spans(_ length: Double) -> [(Double, Double)] {
+        if length <= tile { return [(0, max(length, 0))] }
+        let step = tile - overlap
+        var offsets = [0.0]
+        var cursor = 0.0
+        while cursor + tile < length - 0.5 {
+            let next = cursor + step
+            let last = length - tile
+            if next >= last - 0.5 {
+                if last > offsets[offsets.count - 1] + 0.5 {
+                    offsets.append(last)
+                }
+                break
+            }
+            offsets.append(next)
+            cursor = next
+        }
+        return offsets.map { ($0, tile) }
+    }
+    var result: [TileFrame] = []
+    for y in spans(height) {
+        for x in spans(width) {
+            result.append(TileFrame(x: x.0, y: y.0, width: x.1, height: y.1))
+        }
+    }
+    return result
+}
+
+/// The tile that contains most of the box. Lines already deduped have no
+/// source index; the crop that still holds the box is the one Vision saw.
+private func assignTiles(_ lines: [OCRLine], width: Double, height: Double) -> [TileFrame?] {
+    let rects = tileRects(width: width, height: height)
+    return lines.map { line in
+        let box = line.bbox
+        let boxArea = max(box.width, 0) * max(box.height, 0)
+        guard boxArea > 0 else { return nil }
+        var best: (TileFrame, Double)?
+        for rect in rects {
+            let x0 = max(box.x, rect.x)
+            let y0 = max(box.y, rect.y)
+            let x1 = min(box.x + box.width, rect.x + rect.width)
+            let y1 = min(box.y + box.height, rect.y + rect.height)
+            let area = max(0, x1 - x0) * max(0, y1 - y0)
+            if area / boxArea >= 0.8, best == nil || area > best!.1 {
+                best = (rect, area)
+            }
+        }
+        return best?.0
+    }
+}
+
+private func fixtureURL(_ name: String) -> URL? {
+    var url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    for _ in 0..<6 {
+        let candidate = url.appendingPathComponent("Sources/LineMergeTestRunner/Fixtures").appendingPathComponent(name)
+        if FileManager.default.fileExists(atPath: candidate.path) {
+            return candidate
+        }
+        url.deleteLastPathComponent()
+    }
+    return nil
+}
+
+private func timing() {
+    let piece = String(repeating: "发票金额 Invoice 100 元 ", count: 4)
+    let tileW = 2048.0
+    let tileH = 2048.0
+    let step = 1792.0
+    let pageW = 6700.0
+    let pageH = 7300.0
+    var frames: [TileFrame] = []
+    var y = 0.0
+    while y < pageH {
+        var x = 0.0
+        let height = min(tileH, pageH - y)
+        while x < pageW {
+            let width = min(tileW, pageW - x)
+            frames.append(TileFrame(x: x, y: y, width: width, height: height))
+            if x + tileW >= pageW { break }
+            let next = x + step
+            let last = pageW - tileW
+            x = next >= last ? last : next
+        }
+        if y + tileH >= pageH { break }
+        let next = y + step
+        let last = pageH - tileH
+        y = next >= last ? last : next
+    }
+
+    func tileContaining(_ x: Double, _ y: Double) -> TileFrame? {
+        frames.first { x >= $0.x && x < $0.x + $0.width && y >= $0.y && y < $0.y + $0.height }
+    }
+
+    var lines: [OCRLine] = []
+    var tiles: [TileFrame?] = []
+    lines.reserveCapacity(1200)
+    for row in 0..<240 {
+        let y = Double(row) * 30 + 40
+        for column in 0..<5 {
+            let x = Double(column) * 1300
+            lines.append(line("\(piece) R\(row)C\(column)", x, y, 1500, 16, 0.5))
+            let centerX = x + 750
+            let centerY = y + 8
+            tiles.append(tileContaining(centerX, centerY))
+        }
+    }
+    check(lines.count == 1200, "fixture size \(lines.count)")
+    let start = Date()
+    let page = LineMerge.assemble(lines, tiles: tiles)
+    let elapsed = Date().timeIntervalSince(start)
+    fputs(String(format: "merge %.1f ms\n", elapsed * 1000), stdout)
+    check(elapsed < 1, "1200 lines took \(elapsed)s")
+    check(page.lines.count == 1200, "timing dropped lines \(page.lines.count)")
+    check(page.rows.count == 240, "timing rows \(page.rows.count)")
+}
