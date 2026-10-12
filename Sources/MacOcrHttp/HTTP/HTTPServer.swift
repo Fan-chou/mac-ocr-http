@@ -95,6 +95,11 @@ final class HTTPServer: @unchecked Sendable {
         )
         self.vision = VisionPool(workers: config.visionWorkers)
         self.slots = DispatchSemaphore(value: config.queueMax + config.visionWorkers + 16)
+        if let dir = config.debugCaptureDir {
+            self.debugStore = DebugCaptureStore(directory: dir, maxCount: config.debugCaptureMax)
+        } else {
+            self.debugStore = nil
+        }
     }
 
     private let listenLock = NSLock()
@@ -102,6 +107,9 @@ final class HTTPServer: @unchecked Sendable {
     private var pending: [String] = []
     private var retryTimer: DispatchSourceTimer?
     private let connectionQueue = DispatchQueue(label: "macocr.http", attributes: .concurrent)
+    /// Disk writes for `OCR_HTTP_DEBUG_CAPTURE_DIR`. Never waited on by a request.
+    private let debugQueue = DispatchQueue(label: "macocr.debug-capture")
+    private let debugStore: DebugCaptureStore?
     /// One handler thread per queued OCR, plus the running workers, plus a few
     /// slots so /health and /stats are not stuck behind a full queue. Shared by
     /// every listening address.
@@ -125,6 +133,9 @@ final class HTTPServer: @unchecked Sendable {
         }
 
         log("mac-ocr-http starting hosts=\(config.hosts.joined(separator: ",")) port=\(config.port) workers=\(config.visionWorkers) queue=\(config.queueMax) model=\(config.openAIModel)")
+        if let dir = config.debugCaptureDir {
+            log("debug capture on dir=\(dir) max=\(config.debugCaptureMax) (stores request images on disk)")
+        }
         for host in config.hosts {
             if !tryListen(host, retrying: false) {
                 listenLock.lock(); pending.append(host); listenLock.unlock()
@@ -207,7 +218,13 @@ final class HTTPServer: @unchecked Sendable {
     private func acceptLoop(fd listenFD: Int32, host: String) {
         while true {
             slots.wait()
-            let client = Darwin.accept(listenFD, nil, nil)
+            var address = sockaddr_in()
+            var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let client = withUnsafeMutablePointer(to: &address) { pointer -> Int32 in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
+                    Darwin.accept(listenFD, raw, &length)
+                }
+            }
             if client < 0 {
                 let error = errno
                 slots.signal()
@@ -217,18 +234,19 @@ final class HTTPServer: @unchecked Sendable {
                 usleep(50_000)
                 continue
             }
+            let peer = ipv4String(address.sin_addr)
             configureClient(client)
             connectionQueue.async {
                 defer {
                     Darwin.close(client)
                     self.slots.signal()
                 }
-                self.handle(client)
+                self.handle(client, peer: peer)
             }
         }
     }
 
-    private func handle(_ fd: Int32) {
+    private func handle(_ fd: Int32, peer: String) {
         let work: RequestWork
         do {
             let request = try HTTPReader.read(
@@ -242,7 +260,7 @@ final class HTTPServer: @unchecked Sendable {
             if case .io(let message) = error {
                 fputs("io: \(message)\n", stderr)
             }
-            if case .bodyTooLarge(let path) = error, isV1(path) {
+            if case .bodyTooLarge(let method, let path) = error, isV1(path) {
                 let response = openAIFailure(
                     OpenAICompat.APIError.invalid(
                         "request body exceeds limit",
@@ -251,12 +269,34 @@ final class HTTPServer: @unchecked Sendable {
                     ),
                     cors: defaultV1CORS()
                 )
-                log("- \(path) 413")
+                log(OpenAICompat.accessLog(method: method, path: path, status: response.status, code: response.logCode))
                 try? HTTPWriter.send(fd, response)
+                capture(
+                    endpoint: path,
+                    peer: peer,
+                    status: response.status,
+                    errorCode: response.logCode,
+                    images: [],
+                    passes: [],
+                    messages: nil,
+                    method: method
+                )
                 return
             }
             log("- - \(error.response.status)")
             try? HTTPWriter.send(fd, error.response)
+            if case .bodyTooLarge(let method, let path) = error {
+                capture(
+                    endpoint: path,
+                    peer: peer,
+                    status: error.response.status,
+                    errorCode: nativeErrorCode(error.response),
+                    images: [],
+                    passes: [],
+                    messages: nil,
+                    method: method
+                )
+            }
             return
         } catch {
             let response = HTTPResponse.json(500, ErrorBody(ok: false, error: "internal error"))
@@ -267,21 +307,101 @@ final class HTTPServer: @unchecked Sendable {
         }
 
         switch work {
-        case .http(let response, let method, let path):
-            log("\(method) \(path) \(response.status)")
+        case .http(let response, let method, let path, let seed):
+            log(OpenAICompat.accessLog(method: method, path: path, status: response.status, code: isV1(path) ? response.logCode : nil))
             try? HTTPWriter.send(fd, response)
+            if let seed {
+                let code = response.status < 400 ? nil : (isV1(path) ? response.logCode : nativeErrorCode(response))
+                capture(
+                    endpoint: path,
+                    peer: peer,
+                    status: response.status,
+                    errorCode: code,
+                    images: seed.images,
+                    passes: [],
+                    messages: seed.messages,
+                    method: method
+                )
+            }
         case .ocr(let holder, let job, let method, let path):
-            let response = performOCR(holder, job)
-            log("\(method) \(path) \(response.status)")
+            // Keep the original bytes only when capture is on. Otherwise Vision
+            // still drops the buffer at the start of recognize.
+            let snapshot: Data? = debugStore == nil ? nil : holder.data
+            let (response, passes) = performOCR(holder, job)
+            log(OpenAICompat.accessLog(method: method, path: path, status: response.status, code: nil))
             try? HTTPWriter.send(fd, response)
+            if let snapshot {
+                capture(
+                    endpoint: path,
+                    peer: peer,
+                    status: response.status,
+                    errorCode: response.status >= 400 ? nativeErrorCode(response) : nil,
+                    images: [snapshot],
+                    passes: passes,
+                    messages: nil,
+                    method: method
+                )
+            }
         case .openai(let job):
+            let images = debugStore == nil ? [] : job.images
             switch performOpenAI(job) {
-            case .json(let response):
-                log("\(job.method) \(job.path) \(response.status)")
+            case .json(let response, let passes):
+                log(OpenAICompat.accessLog(method: job.method, path: job.path, status: response.status, code: response.logCode))
                 try? HTTPWriter.send(fd, response)
-            case .events(let events):
-                log("\(job.method) \(job.path) 200")
+                capture(
+                    endpoint: job.path,
+                    peer: peer,
+                    status: response.status,
+                    errorCode: response.logCode,
+                    images: images,
+                    passes: passes,
+                    messages: job.messages,
+                    method: job.method
+                )
+            case .events(let events, let passes):
+                log(OpenAICompat.accessLog(method: job.method, path: job.path, status: 200, code: nil))
                 try? HTTPWriter.sendEventStream(fd, version: job.version, events: events, headers: job.cors)
+                capture(
+                    endpoint: job.path,
+                    peer: peer,
+                    status: 200,
+                    errorCode: nil,
+                    images: images,
+                    passes: passes,
+                    messages: job.messages,
+                    method: job.method
+                )
+            }
+        }
+    }
+
+    /// Copies the capture onto `debugQueue` and returns. A disabled store does no work.
+    private func capture(
+        endpoint: String,
+        peer: String,
+        status: Int,
+        errorCode: String?,
+        images: [Data],
+        passes: [DebugPassSummary],
+        messages: [DebugMessageSummary]?,
+        method: String
+    ) {
+        guard let debugStore, method == "POST", isCapturePath(endpoint), DebugCapture.records(status: status) else { return }
+        let meta = DebugCapture.makeMeta(
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            endpoint: endpoint,
+            clientIP: peer,
+            status: status,
+            errorCode: status >= 400 ? errorCode : nil,
+            passes: passes,
+            messages: messages
+        )
+        debugQueue.async {
+            do {
+                try debugStore.save(meta: meta, images: images)
+            } catch {
+                let reason = String(String(describing: error).prefix(180))
+                fputs("debug capture failed: \(reason)\n", stderr)
             }
         }
     }
@@ -293,44 +413,47 @@ final class HTTPServer: @unchecked Sendable {
         }
         switch (request.method, request.path) {
         case ("GET", "/health"):
-            return .http(HTTPResponse.health(), request.method, request.path)
+            return httpWork(HTTPResponse.health(), request.method, request.path)
         case ("GET", "/languages"):
-            return .http(languages(request), request.method, request.path)
+            return httpWork(languages(request), request.method, request.path)
         case ("GET", "/stats"):
-            return .http(stats(request), request.method, request.path)
+            return httpWork(stats(request), request.method, request.path)
         case ("POST", "/ocr"):
             guard auth.allows(request.headers) else {
-                return .http(.unauthorized(), request.method, request.path)
+                return httpWork(.unauthorized(), request.method, request.path)
             }
             do {
                 let parsed = try parseOCRBody(request)
                 if parsed.data.isEmpty {
-                    return .http(
+                    return httpWork(
                         HTTPResponse.json(400, ErrorBody(ok: false, error: "empty image")),
                         request.method,
-                        request.path
+                        request.path,
+                        seed: failedOCRSeed(request)
                     )
                 }
                 return .ocr(DataHolder(parsed.data), parsed.job, request.method, request.path)
             } catch let error as BadRequest {
-                return .http(
+                return httpWork(
                     HTTPResponse.json(400, ErrorBody(ok: false, error: error.message)),
                     request.method,
-                    request.path
+                    request.path,
+                    seed: failedOCRSeed(request)
                 )
             } catch {
-                return .http(
+                return httpWork(
                     HTTPResponse.json(400, ErrorBody(ok: false, error: "bad request")),
                     request.method,
-                    request.path
+                    request.path,
+                    seed: failedOCRSeed(request)
                 )
             }
         case (_, "/health"), (_, "/languages"), (_, "/stats"):
-            return .http(methodNotAllowed("GET"), request.method, request.path)
+            return httpWork(methodNotAllowed("GET"), request.method, request.path)
         case (_, "/ocr"):
-            return .http(methodNotAllowed("POST"), request.method, request.path)
+            return httpWork(methodNotAllowed("POST"), request.method, request.path)
         default:
-            return .http(
+            return httpWork(
                 HTTPResponse.json(404, ErrorBody(ok: false, error: "not found")),
                 request.method,
                 request.path
@@ -365,12 +488,12 @@ final class HTTPServer: @unchecked Sendable {
         ))
     }
 
-    private func performOCR(_ holder: DataHolder, _ job: OCRJob) -> HTTPResponse {
+    private func performOCR(_ holder: DataHolder, _ job: OCRJob) -> (HTTPResponse, [DebugPassSummary]) {
         switch admission.acquire() {
         case .full:
-            return busy("queue full")
+            return (busy("queue full"), [])
         case .timedOut:
-            return busy("queue wait timed out")
+            return (busy("queue wait timed out"), [])
         case .ready(let index):
             defer { admission.release(index) }
             do {
@@ -382,7 +505,7 @@ final class HTTPServer: @unchecked Sendable {
                     maxPixel: config.maxPixel,
                     minGlyphFrac: config.tileMinGlyphFrac
                 )
-                return HTTPResponse.json(200, OCRSuccessBody(
+                let response = HTTPResponse.json(200, OCRSuccessBody(
                     ok: true,
                     text: payload.text,
                     width: payload.width,
@@ -402,46 +525,54 @@ final class HTTPServer: @unchecked Sendable {
                     rows: payload.rows,
                     blocks: payload.blocks
                 ))
+                return (response, [DebugPassSummary(
+                    elapsedMs: payload.elapsedMs,
+                    mode: payload.mode,
+                    tiles: payload.tiles,
+                    glyphFrac: payload.glyphFrac,
+                    text: payload.text,
+                    rows: payload.rows.map(\.text)
+                )])
             } catch let error as ImageDecodeError {
                 switch error {
                 case .tooLarge(let width, let height, let maxPixels):
-                    return HTTPResponse.json(413, TooLargeBody(
+                    return (HTTPResponse.json(413, TooLargeBody(
                         ok: false,
                         error: "image too large",
                         maxPixels: maxPixels,
                         width: width,
                         height: height
-                    ))
+                    )), [])
                 case .unrecognized:
-                    return HTTPResponse.json(415, ErrorBody(ok: false, error: error.description))
+                    return (HTTPResponse.json(415, ErrorBody(ok: false, error: error.description)), [])
                 }
             } catch let error as OCREngineError {
                 switch error {
                 case .badRequest(let message):
-                    return HTTPResponse.json(400, ErrorBody(ok: false, error: message))
+                    return (HTTPResponse.json(400, ErrorBody(ok: false, error: message)), [])
                 case .vision(let message):
                     let trimmed = message.count > 180 ? String(message.prefix(180)) : message
                     fputs("vision error: \(trimmed)\n", stderr)
-                    return HTTPResponse.json(500, ErrorBody(ok: false, error: "vision recognition failed: \(trimmed)"))
+                    return (HTTPResponse.json(500, ErrorBody(ok: false, error: "vision recognition failed: \(trimmed)")), [])
                 }
             } catch {
                 fputs("ocr error: \(error)\n", stderr)
-                return HTTPResponse.json(500, ErrorBody(ok: false, error: "internal error"))
+                return (HTTPResponse.json(500, ErrorBody(ok: false, error: "internal error")), [])
             }
         }
     }
 
     private func classifyV1(_ request: HTTPRequest) -> RequestWork {
         if request.method == "OPTIONS" {
-            return .http(v1Preflight(request), request.method, request.path)
+            return httpWork(v1Preflight(request), request.method, request.path)
         }
         let cors = v1CORS(request)
         guard auth.allows(request.headers) else {
-            return .http(openAIUnauthorized(cors), request.method, request.path)
+            return httpWork(openAIUnauthorized(cors), request.method, request.path)
         }
         if request.method == "GET", request.path == "/v1/models" {
             let created = Int(Date().timeIntervalSince1970)
-            return .http(
+            return httpWork(
                 v1JSON(200, OpenAICompat.modelsList(id: config.openAIModel, created: created), cors: cors),
                 request.method,
                 request.path
@@ -452,13 +583,13 @@ final class HTTPServer: @unchecked Sendable {
             let id = percentDecode(raw)
             if id == config.openAIModel {
                 let created = Int(Date().timeIntervalSince1970)
-                return .http(
+                return httpWork(
                     v1JSON(200, OpenAICompat.modelJSON(id: id, created: created), cors: cors),
                     request.method,
                     request.path
                 )
             }
-            return .http(
+            return httpWork(
                 openAIFailure(
                     .invalid("The model '\(id)' does not exist", param: "model", code: "model_not_found", status: 404),
                     cors: cors
@@ -468,7 +599,7 @@ final class HTTPServer: @unchecked Sendable {
             )
         }
         if request.path == "/v1/models" || request.path.hasPrefix("/v1/models/") {
-            return .http(
+            return httpWork(
                 openAIFailure(.invalid("method not allowed", code: "method_not_allowed", status: 405), cors: cors, extra: ["Allow": "GET, OPTIONS"]),
                 request.method,
                 request.path
@@ -492,26 +623,33 @@ final class HTTPServer: @unchecked Sendable {
                     languages: parsed.languages,
                     promptScalars: parsed.promptScalars,
                     wire: parsed.wire,
-                    cors: cors
+                    cors: cors,
+                    messages: debugStore == nil ? nil : DebugCapture.messageSummaries(json: request.body)
                 ))
             } catch let error as OpenAICompat.APIError {
-                return .http(openAIFailure(error, cors: cors), request.method, request.path)
+                return httpWork(
+                    openAIFailure(error, cors: cors),
+                    request.method,
+                    request.path,
+                    seed: v1FailureSeed(request)
+                )
             } catch {
-                return .http(
+                return httpWork(
                     openAIFailure(.invalid("bad request", code: "invalid_json"), cors: cors),
                     request.method,
-                    request.path
+                    request.path,
+                    seed: v1FailureSeed(request)
                 )
             }
         }
         if request.path == "/v1/chat/completions" || request.path == "/v1/responses" {
-            return .http(
+            return httpWork(
                 openAIFailure(.invalid("method not allowed", code: "method_not_allowed", status: 405), cors: cors, extra: ["Allow": "POST, OPTIONS"]),
                 request.method,
                 request.path
             )
         }
-        return .http(
+        return httpWork(
             openAIFailure(.invalid("not found", code: "not_found", status: 404), cors: cors),
             request.method,
             request.path
@@ -519,19 +657,22 @@ final class HTTPServer: @unchecked Sendable {
     }
 
     private func performOpenAI(_ job: OpenAIJob) -> OpenAIOutcome {
+        if job.images.isEmpty {
+            return openAIResult(job, content: "", passes: [])
+        }
         switch admission.acquire() {
         case .full:
             return .json(openAIFailure(
                 OpenAICompat.APIError(status: 503, message: "queue full", type: "server_error", param: nil, code: "queue_full"),
                 cors: job.cors,
                 extra: ["Retry-After": "1"]
-            ))
+            ), [])
         case .timedOut:
             return .json(openAIFailure(
                 OpenAICompat.APIError(status: 503, message: "queue wait timed out", type: "server_error", param: nil, code: "queue_timeout"),
                 cors: job.cors,
                 extra: ["Retry-After": "1"]
-            ))
+            ), [])
         case .ready(let index):
             defer { admission.release(index) }
             let ocrJob = OCRJob(
@@ -546,6 +687,7 @@ final class HTTPServer: @unchecked Sendable {
             )
             var images = job.images
             var texts: [String] = []
+            var passes: [DebugPassSummary] = []
             texts.reserveCapacity(images.count)
             for offset in images.indices {
                 let holder = DataHolder(images[offset])
@@ -560,47 +702,87 @@ final class HTTPServer: @unchecked Sendable {
                         minGlyphFrac: config.tileMinGlyphFrac
                     )
                     texts.append(payload.text)
+                    passes.append(DebugPassSummary(
+                        elapsedMs: payload.elapsedMs,
+                        mode: payload.mode,
+                        tiles: payload.tiles,
+                        glyphFrac: payload.glyphFrac,
+                        text: payload.text,
+                        rows: payload.rows.map(\.text)
+                    ))
                 } catch {
-                    return .json(openAIFailure(openAIMap(error), cors: job.cors))
+                    return .json(openAIFailure(openAIMap(error), cors: job.cors), passes)
                 }
             }
-            let content = texts.joined(separator: "\n\n")
-            let created = Int(Date().timeIntervalSince1970)
-            let usage = OpenAICompat.Usage(promptScalars: job.promptScalars, completion: content)
-            let id = OpenAICompat.completionID(prefix: job.wire == .chat ? "chatcmpl-" : "resp_")
-            if job.stream {
-                let events = OpenAICompat.sseEvents(
-                    wire: job.wire,
-                    id: id,
-                    created: created,
-                    model: job.model,
-                    content: content,
-                    usage: usage,
-                    includeUsage: job.includeUsage
-                )
-                return .events(events)
-            }
-            let body: Data
-            switch job.wire {
-            case .chat:
-                body = OpenAICompat.chatCompletionJSON(id: id, created: created, model: job.model, content: content, usage: usage)
-            case .responses:
-                body = OpenAICompat.responsesJSON(id: id, created: created, model: job.model, content: content, usage: usage)
-            }
-            return .json(v1JSON(200, body, cors: job.cors))
+            return openAIResult(job, content: texts.joined(separator: "\n\n"), passes: passes)
         }
+    }
+
+    /// Chat or Responses bytes. A text-only probe calls this without taking a worker.
+    private func openAIResult(_ job: OpenAIJob, content: String, passes: [DebugPassSummary]) -> OpenAIOutcome {
+        let created = Int(Date().timeIntervalSince1970)
+        let usage = OpenAICompat.Usage(promptScalars: job.promptScalars, completion: content)
+        let id = OpenAICompat.completionID(prefix: job.wire == .chat ? "chatcmpl-" : "resp_")
+        if job.stream {
+            return .events(OpenAICompat.sseEvents(
+                wire: job.wire,
+                id: id,
+                created: created,
+                model: job.model,
+                content: content,
+                usage: usage,
+                includeUsage: job.includeUsage
+            ), passes)
+        }
+        let body: Data
+        switch job.wire {
+        case .chat:
+            body = OpenAICompat.chatCompletionJSON(id: id, created: created, model: job.model, content: content, usage: usage)
+        case .responses:
+            body = OpenAICompat.responsesJSON(id: id, created: created, model: job.model, content: content, usage: usage)
+        }
+        return .json(v1JSON(200, body, cors: job.cors), passes)
+    }
+
+    private func httpWork(
+        _ response: HTTPResponse,
+        _ method: String,
+        _ path: String,
+        seed: CaptureSeed? = nil
+    ) -> RequestWork {
+        .http(response, method, path, seed)
+    }
+
+    /// Decoded image bytes when the body is an image or a JSON `image` field.
+    /// A failed decode stores no file, so the base64 text is not written.
+    private func failedOCRSeed(_ request: HTTPRequest) -> CaptureSeed? {
+        guard debugStore != nil else { return nil }
+        return CaptureSeed(images: debugImages(from: request), messages: nil)
+    }
+
+    private func v1FailureSeed(_ request: HTTPRequest) -> CaptureSeed? {
+        guard debugStore != nil else { return nil }
+        return CaptureSeed(
+            images: [],
+            messages: DebugCapture.messageSummaries(json: request.body)
+        )
     }
 }
 
+private struct CaptureSeed {
+    var images: [Data]
+    var messages: [DebugMessageSummary]?
+}
+
 private enum RequestWork {
-    case http(HTTPResponse, String, String)
+    case http(HTTPResponse, String, String, CaptureSeed?)
     case ocr(DataHolder, OCRJob, String, String)
     case openai(OpenAIJob)
 }
 
 private enum OpenAIOutcome {
-    case json(HTTPResponse)
-    case events([Data])
+    case json(HTTPResponse, [DebugPassSummary])
+    case events([Data], [DebugPassSummary])
 }
 
 private struct OpenAIJob {
@@ -615,6 +797,41 @@ private struct OpenAIJob {
     var promptScalars: Int
     var wire: OpenAICompat.Wire
     var cors: [String: String]
+    var messages: [DebugMessageSummary]?
+}
+
+private func isCapturePath(_ path: String) -> Bool {
+    path == "/ocr" || path == "/v1/chat/completions" || path == "/v1/responses"
+}
+
+private func nativeErrorCode(_ response: HTTPResponse) -> String? {
+    guard response.status >= 400,
+          let object = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any],
+          let error = object["error"] as? String,
+          !error.isEmpty,
+          error.count <= 200 else {
+        return nil
+    }
+    return error
+}
+
+/// Original image bytes for a failed `/ocr` request. JSON base64 is decoded;
+/// the text form is not kept.
+private func debugImages(from request: HTTPRequest) -> [Data] {
+    let type = mediaType(from: request.headers["content-type"])
+    if type == "application/json" || type == "text/json" {
+        guard let object = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
+              let image = object["image"] as? String,
+              let data = try? decodeBase64Image(image),
+              !data.isEmpty else {
+            return []
+        }
+        return [data]
+    }
+    if type == "application/octet-stream" || type.hasPrefix("image/") {
+        return request.body.isEmpty ? [] : [request.body]
+    }
+    return []
 }
 
 private func isV1(_ path: String) -> Bool {
@@ -676,7 +893,8 @@ private func openAIFailure(
         status: error.status,
         reason: reasonPhrase(error.status),
         headers: headers,
-        body: OpenAICompat.errorJSON(error)
+        body: OpenAICompat.errorJSON(error),
+        logCode: error.code
     )
 }
 

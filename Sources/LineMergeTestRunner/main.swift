@@ -84,6 +84,7 @@ private func run() {
     stackedParagraphCenter()
     tilePolicy()
     openAICompatTests()
+    debugCaptureTests()
 }
 
 /// Two ~2000px fragments of one repetitive row, sharing only the 256px tile overlap.
@@ -686,7 +687,49 @@ private func openAICompatTests() {
     ])
     check(noUser.images.count == 1 && noUser.images[0].data == png, "system fallback")
 
-    expectError(["messages": [["role": "user", "content": "text only"]]], code: "missing_image")
+    let scanner = "Act like a text scanner. Extract text as it is without analyzing it."
+    let validate = tryParse([
+        "model": "mac-ocr",
+        "temperature": 0.7,
+        "stream": true,
+        "messages": [["role": "user", "content": scanner]],
+    ])
+    check(validate.images.isEmpty, "validate has no image")
+    check(validate.stream, "validate streams")
+    check(validate.model == "mac-ocr", "validate model")
+    check(validate.promptScalars == scanner.unicodeScalars.count, "validate scalars")
+
+    let emptyMessages = tryParse(["model": "mac-ocr", "messages": [Any](), "stream": false])
+    check(emptyMessages.images.isEmpty && emptyMessages.stream == false, "empty messages")
+    let missingMessages = tryParse(["model": "mac-ocr"])
+    check(missingMessages.images.isEmpty, "missing messages")
+
+    let stranslate = tryParse([
+        "model": "mac-ocr",
+        "temperature": 0.7,
+        "messages": [
+            ["role": "system", "content": "markdown rules"],
+            ["role": "user", "content": [
+                ["type": "text", "text": "please read"],
+                ["type": "image_url", "image_url": ["url": dataURL("image/jpeg", jpeg)]],
+            ]],
+        ],
+    ])
+    check(stranslate.images.count == 1 && stranslate.images[0].data == jpeg, "stranslate jpeg")
+    check(stranslate.images[0].mediaType == "image/jpeg", "stranslate jpeg type")
+    check(stranslate.stream == false, "stranslate ocr is not a stream")
+    let stranslatePNG = tryParse([
+        "model": "gpt-4o",
+        "messages": [[
+            "role": "user",
+            "content": [
+                ["type": "text", "text": "please read"],
+                ["type": "image_url", "image_url": ["url": dataURL("image/png", png)]],
+            ],
+        ]],
+    ])
+    check(stranslatePNG.images.count == 1 && stranslatePNG.images[0].mediaType == "image/png", "stranslate png")
+
     expectError(["messages": "nope"], code: nil)
     expectError([
         "messages": [[
@@ -718,7 +761,6 @@ private func openAICompatTests() {
             "content": [["type": "image_url", "image_url": "data:text/html;base64,\(b64(Data("hi".utf8)))"]],
         ]],
     ], code: "invalid_image_url")
-    expectError(["messages": []], code: "missing_image")
 
     let unknownHint = tryParse([
         "messages": [[
@@ -745,7 +787,16 @@ private func openAICompatTests() {
     check(responses.images[0].data == png && responses.images[1].data == jpeg, "responses order")
     check(responses.languages == ["zh-Hant"], "responses hint")
     check(responses.model == "custom-model", "responses model")
-    expectResponsesError(["input": "Reply with OK.", "instructions": "system"], code: "missing_image")
+    let textProbe = tryResponses([
+        "model": "mac-ocr",
+        "instructions": "system",
+        "input": "Reply with OK.",
+        "stream": true,
+        "temperature": 0.7,
+    ])
+    check(textProbe.images.isEmpty && textProbe.stream, "responses text probe")
+    let noInput = tryResponses(["model": "mac-ocr"])
+    check(noInput.images.isEmpty && noInput.stream == false, "responses without input")
 
     let usage = OpenAICompat.Usage(promptScalars: 4, completion: "ab\n\ncd")
     check(usage.completionTokens == 6 && usage.totalTokens == 10, "usage \(usage)")
@@ -763,6 +814,17 @@ private func openAICompatTests() {
     let message = choices.first?["message"] as? [String: Any]
     check(message?["role"] as? String == "assistant", "assistant role")
     check(message?["content"] as? String == "ab\n\ncd", "plain text despite json_object")
+    let emptyCompletion = jsonObject(OpenAICompat.chatCompletionJSON(
+        id: "chatcmpl-empty",
+        created: 1,
+        model: "mac-ocr",
+        content: "",
+        usage: OpenAICompat.Usage(promptScalars: scanner.unicodeScalars.count, completion: "")
+    ))
+    let emptyChoices = emptyCompletion["choices"] as? [[String: Any]] ?? []
+    let emptyMessage = emptyChoices.first?["message"] as? [String: Any]
+    check(emptyMessage?["content"] as? String == "", "empty validate content")
+    check(emptyChoices.first?["finish_reason"] as? String == "stop", "empty finish")
     check(choices.first?["finish_reason"] as? String == "stop", "finish stop")
     check(completion["system_fingerprint"] as? String == "fp_macocr", "fingerprint")
 
@@ -799,6 +861,38 @@ private func openAICompatTests() {
     check(sawRole && sawStop && sawUsage, "sse markers role=\(sawRole) stop=\(sawStop) usage=\(sawUsage)")
     check(pieces == "ab\n\ncd", "sse concat \(pieces)")
 
+    let emptyEvents = OpenAICompat.sseEvents(
+        wire: .chat,
+        id: "chatcmpl-empty",
+        created: 1,
+        model: "mac-ocr",
+        content: "",
+        usage: OpenAICompat.Usage(promptScalars: 0, completion: ""),
+        includeUsage: false
+    )
+    check(String(data: emptyEvents.last ?? Data(), encoding: .utf8) == "data: [DONE]\n\n", "empty stream done")
+    var emptyPieces = ""
+    var emptyRole = false
+    var emptyStop = false
+    for event in emptyEvents.dropLast() {
+        let text = String(data: event, encoding: .utf8) ?? ""
+        let payload = jsonObject(Data(text.dropFirst(6).dropLast(2).utf8))
+        let choice = ((payload["choices"] as? [Any])?.first as? [String: Any]) ?? [:]
+        let delta = choice["delta"] as? [String: Any] ?? [:]
+        if delta["role"] as? String == "assistant" { emptyRole = true }
+        if let content = delta["content"] as? String { emptyPieces += content }
+        if choice["finish_reason"] as? String == "stop" { emptyStop = true }
+    }
+    check(emptyRole && emptyStop && emptyPieces.isEmpty, "empty stream markers")
+
+    let denied = OpenAICompat.accessLog(method: "POST", path: "/v1/chat/completions", status: 400, code: "invalid_image_url")
+    check(denied == "POST /v1/chat/completions 400 invalid_image_url", "error log \(denied)")
+    check(!denied.contains("Bearer") && !denied.contains("http"), "log has no secret or url")
+    let okLine = OpenAICompat.accessLog(method: "POST", path: "/v1/chat/completions", status: 200, code: nil)
+    check(okLine == "POST /v1/chat/completions 200", "ok log \(okLine)")
+    let queued = OpenAICompat.accessLog(method: "POST", path: "/v1/responses", status: 503, code: "queue_full")
+    check(queued == "POST /v1/responses 503 queue_full", "queue log \(queued)")
+
     let framed = OpenAICompat.chunkFrame(Data("data: hi\n\n".utf8))
     check(framed == Data("a\r\ndata: hi\n\n\r\n".utf8), "chunk frame \(framed as NSData)")
     check(OpenAICompat.chunkTerminator() == Data("0\r\n\r\n".utf8), "chunk end")
@@ -834,6 +928,179 @@ private func openAICompatTests() {
     check(err["type"] as? String == "invalid_request_error", "error type")
     check(err["param"] as? String == "image_url", "error param")
     check(err["code"] as? String == "invalid_image_url", "error code")
+}
+
+private func debugCaptureTests() {
+    let token = "SUPERSECRETTOKENVALUE"
+    let queryValue = "QUERYVALUE9f3a"
+    let imagePayload = "QUJDREVGR0hJSktMTQBASE64PAYLOAD"
+    let textPayload = "SHOULDNOTAPPEAR"
+    let prompt = "please read the sign"
+    let body: [String: Any] = [
+        "authorization": "Bearer \(token)",
+        "api_key": token,
+        "query": queryValue,
+        "temperature": 0.7,
+        "model": "mac-ocr",
+        "messages": [
+            ["role": "system", "content": "markdown rules"],
+            ["role": "user", "content": [
+                ["type": "text", "text": prompt],
+                ["type": "text", "text": "data:image/png;base64,\(textPayload)"],
+                ["type": "image_url", "image_url": ["url": "data:image/png;base64,\(imagePayload)", "detail": "low"]],
+            ]],
+        ],
+    ]
+    let summaries = DebugCapture.messageSummaries(json: jsonData(body))
+    check(summaries.count == 2, "summary count \(summaries.count)")
+    check(summaries[0].role == "system" && summaries[0].texts == ["markdown rules"] && summaries[0].imageCount == 0, "system summary")
+    check(summaries[1].role == "user", "user role")
+    check(summaries[1].texts.count == 2, "two text parts")
+    check(summaries[1].texts[0] == prompt, "prompt kept")
+    check(summaries[1].texts[1] == "data:image/png;base64,[redacted]", "text data url redacted")
+    check(summaries[1].imageCount == 1, "image counted without its url")
+
+    let meta = DebugCapture.makeMeta(
+        timestamp: "2026-10-12T00:00:01Z",
+        endpoint: "/v1/chat/completions",
+        clientIP: "127.0.0.1",
+        status: 200,
+        errorCode: nil,
+        passes: [DebugPassSummary(elapsedMs: 12, mode: "whole", tiles: 1, glyphFrac: 0.02, text: "line", rows: ["line"])],
+        messages: summaries
+    )
+    let encoded = try! DebugCapture.metaJSON(meta)
+    assertRedacted(encoded, "meta")
+    let object = jsonObject(encoded)
+    check(object["mode"] as? String == "whole", "one pass mode")
+    check(object["tiles"] as? Int == 1, "one pass tiles")
+    check(object["text"] as? String == "line", "returned text")
+    check((object["rows"] as? [String]) == ["line"], "returned rows")
+    check(object["errorCode"] == nil, "success has no error code")
+
+    let empty = DebugCapture.makeMeta(
+        timestamp: "2026-10-12T00:00:02Z",
+        endpoint: "/v1/chat/completions",
+        clientIP: "127.0.0.1",
+        status: 200,
+        errorCode: nil,
+        passes: [],
+        messages: summaries
+    )
+    let emptyObject = jsonObject(try! DebugCapture.metaJSON(empty))
+    check(emptyObject["text"] as? String == "", "text-only probe stores empty text")
+    check(emptyObject["mode"] == nil, "text-only probe has no mode")
+
+    let failed = DebugCapture.makeMeta(
+        timestamp: "2026-10-12T00:00:03Z",
+        endpoint: "/v1/chat/completions",
+        clientIP: "127.0.0.1",
+        status: 400,
+        errorCode: "invalid_image_url",
+        passes: [],
+        messages: []
+    )
+    let failedObject = jsonObject(try! DebugCapture.metaJSON(failed))
+    check(failedObject["errorCode"] as? String == "invalid_image_url", "error code kept")
+    check(failedObject["text"] == nil, "failed capture has no text")
+    check(Set(failedObject.keys).isSubset(of: DebugCapture.metaKeys), "failed keys")
+
+    check(DebugCapture.records(status: 200), "authenticated success is captured")
+    check(DebugCapture.records(status: 400), "authenticated 400 is captured")
+    check(DebugCapture.records(status: 413), "authenticated 413 is captured")
+    check(DebugCapture.records(status: 500), "authenticated 500 is captured")
+    check(!DebugCapture.records(status: 401), "401 is not captured")
+    let admitted = [401, 401, 200, 400].filter(DebugCapture.records)
+    check(admitted == [200, 400], "401s do not take ring slots \(admitted)")
+
+    check(DebugCapture.evictionIDs(existingOldestFirst: ["000001", "000002", "000003"], maxCount: 2) == ["000001"], "evict oldest")
+    check(DebugCapture.evictionIDs(existingOldestFirst: ["000001", "000002"], maxCount: 2).isEmpty, "at the cap")
+    check(DebugCapture.evictionIDs(existingOldestFirst: ["000001"], maxCount: 0) == ["000001"], "max zero drops all")
+
+    let responsesBody: [String: Any] = [
+        "token": token,
+        "instructions": "You are an OCR engine.",
+        "input": [[
+            "role": "user",
+            "content": [
+                ["type": "input_text", "text": prompt],
+                ["type": "input_image", "image_url": "data:image/jpeg;base64,\(imagePayload)"],
+            ],
+        ]],
+    ]
+    let responses = DebugCapture.messageSummaries(json: jsonData(responsesBody))
+    check(responses.count == 2, "responses summary count")
+    check(responses[0].role == "instructions" && responses[0].texts == ["You are an OCR engine."], "instructions")
+    check(responses[1].imageCount == 1 && responses[1].texts == [prompt], "responses image count")
+    let responsesJSON = try! DebugCapture.metaJSON(DebugCapture.makeMeta(
+        timestamp: "2026-10-12T00:00:04Z",
+        endpoint: "/v1/responses",
+        clientIP: "192.168.1.50",
+        status: 200,
+        errorCode: nil,
+        passes: [],
+        messages: responses
+    ))
+    assertRedacted(responsesJSON, "responses meta")
+
+    let root = "/tmp/macocr-capture-\(UUID().uuidString)"
+    defer { try? FileManager.default.removeItem(atPath: root) }
+    let store = DebugCaptureStore(directory: root, maxCount: 2)
+    let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x11, 0x22])
+    for index in 1...3 {
+        let record = DebugCapture.makeMeta(
+            timestamp: "2026-10-12T00:00:0\(index)Z",
+            endpoint: "/ocr",
+            clientIP: "127.0.0.1",
+            status: 200,
+            errorCode: nil,
+            passes: [DebugPassSummary(elapsedMs: index, mode: "whole", tiles: 1, glyphFrac: 0.02, text: "row \(index)", rows: ["row \(index)"])],
+            messages: summaries
+        )
+        try! store.save(meta: record, images: [png])
+    }
+    let names = ((try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []).filter { Int($0) != nil }.sorted()
+    check(names == ["000002", "000003"], "ring kept \(names)")
+    check(!FileManager.default.fileExists(atPath: (root as NSString).appendingPathComponent("000001")), "oldest removed")
+    check(posixMode(root) == 0o700, "capture dir mode \(posixMode(root))")
+    let kept = (root as NSString).appendingPathComponent("000003")
+    check(posixMode(kept) == 0o700, "entry dir mode \(posixMode(kept))")
+    let metaPath = (kept as NSString).appendingPathComponent("meta.json")
+    let imagePath = (kept as NSString).appendingPathComponent("image-0.png")
+    check(posixMode(metaPath) == 0o600, "meta mode \(posixMode(metaPath))")
+    check(posixMode(imagePath) == 0o600, "image mode \(posixMode(imagePath))")
+    let saved = try! Data(contentsOf: URL(fileURLWithPath: imagePath))
+    check(saved == png, "original image bytes")
+    assertRedacted(try! Data(contentsOf: URL(fileURLWithPath: metaPath)), "stored meta")
+    let stored = jsonObject(try! Data(contentsOf: URL(fileURLWithPath: metaPath)))
+    check(stored["endpoint"] as? String == "/ocr", "stored endpoint")
+    check(stored["text"] as? String == "row 3", "newest text kept")
+}
+
+private func assertRedacted(_ data: Data, _ label: String) {
+    let text = String(data: data, encoding: .utf8) ?? ""
+    check(!text.contains("SUPERSECRETTOKENVALUE"), "\(label) dropped the token")
+    check(!text.contains("QUERYVALUE9f3a"), "\(label) dropped the query value")
+    check(!text.contains("QUJDREVGR0hJSktMTQBASE64PAYLOAD"), "\(label) dropped image base64")
+    check(!text.contains("SHOULDNOTAPPEAR"), "\(label) dropped a data URL in text")
+    check(!text.contains("authorization"), "\(label) dropped the authorization field")
+    check(!text.contains("Bearer"), "\(label) dropped the bearer scheme")
+    check(text.contains("please read the sign"), "\(label) kept the prompt")
+    let object = jsonObject(data)
+    check(Set(object.keys).isSubset(of: DebugCapture.metaKeys), "\(label) keys \(Set(object.keys))")
+    if let messages = object["messages"] as? [[String: Any]] {
+        for message in messages {
+            check(Set(message.keys).isSubset(of: DebugCapture.messageKeys), "\(label) message keys")
+        }
+    }
+}
+
+private func posixMode(_ path: String) -> Int {
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+          let number = attrs[.posixPermissions] as? NSNumber else {
+        return -1
+    }
+    return Int(number.uint16Value) & 0o777
 }
 
 private func wrapped(_ url: String) -> String {

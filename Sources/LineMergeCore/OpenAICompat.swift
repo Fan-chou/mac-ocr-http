@@ -8,6 +8,9 @@ import Foundation
 /// this type only returns them in that order. Text prompts are not
 /// instructions. A line `ocr-language: <tag>` (or `recognition-language`)
 /// is the only hint that is read, and only for a short allowlist.
+/// A request with no image is a successful empty completion. Validators such
+/// as STranslate send a text-only `stream: true` probe and treat any non-2xx
+/// status as failure. They do not require the content to be non-empty.
 public enum OpenAICompat {
     public static let fingerprint = "fp_macocr"
     public static let owner = "mac-ocr-http"
@@ -114,11 +117,7 @@ public enum OpenAICompat {
         } else if let list = input as? [Any] {
             messages = try responsesInput(list)
         } else if input == nil {
-            throw APIError.invalid(
-                "no image in the request",
-                param: "input",
-                code: "missing_image"
-            )
+            messages = []
         } else {
             throw APIError.invalid("input must be a string, a message, or an array", param: "input")
         }
@@ -211,6 +210,15 @@ public enum OpenAICompat {
 
     public static func chunkTerminator() -> Data {
         Data("0\r\n\r\n".utf8)
+    }
+
+    /// Stdout line for one response. A 4xx/5xx on `/v1` appends the error code
+    /// and nothing else: no message, body, token, or query.
+    public static func accessLog(method: String, path: String, status: Int, code: String?) -> String {
+        if status >= 400, let code, !code.isEmpty {
+            return "\(method) \(path) \(status) \(code)"
+        }
+        return "\(method) \(path) \(status)"
     }
 
     public static func completionID(prefix: String) -> String {
@@ -440,10 +448,12 @@ private extension OpenAICompat {
     }
 
     static func parseMessages(_ object: [String: Any], wire: Wire, messagesKey: String) throws -> Parsed {
-        guard let raw = object[messagesKey] else {
-            throw APIError.invalid("no image in the request", param: messagesKey, code: "missing_image")
+        let messages: [Any]
+        if let raw = object[messagesKey] {
+            messages = try messageList(raw, param: messagesKey)
+        } else {
+            messages = []
         }
-        let messages = try messageList(raw, param: messagesKey)
         return try finish(object, messages: messages, extraText: [], wire: wire)
     }
 
@@ -480,13 +490,6 @@ private extension OpenAICompat {
             collected.append(try collect(message))
         }
         let images = selectImages(collected)
-        if images.isEmpty {
-            throw APIError.invalid(
-                "no image in the request",
-                param: wire == .chat ? "messages" : "input",
-                code: "missing_image"
-            )
-        }
         var texts = extraText
         var scalars = extraText.reduce(0) { $0 + $1.unicodeScalars.count }
         for message in collected {

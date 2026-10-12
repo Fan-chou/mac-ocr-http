@@ -17,6 +17,9 @@ struct AppConfig: Sendable {
     var tileMinGlyphFrac: Double
     /// Model id listed by `GET /v1/models`. Chat requests may send any model string.
     var openAIModel: String
+    /// `nil` unless `OCR_HTTP_DEBUG_CAPTURE_DIR` is set. Off by default.
+    var debugCaptureDir: String?
+    var debugCaptureMax: Int
 
     static let defaultHosts = ["127.0.0.1"]
     static let defaultPort: UInt16 = 8741
@@ -28,6 +31,7 @@ struct AppConfig: Sendable {
     static let defaultQueueTimeoutMs = 180_000
     static let defaultTileMinGlyphFrac = TilePolicy.defaultMinGlyphFrac
     static let defaultOpenAIModel = "mac-ocr"
+    static let defaultDebugCaptureMax = 50
 
     static func load() throws -> AppConfig {
         let hostArgument = try parseArguments()
@@ -76,6 +80,13 @@ struct AppConfig: Sendable {
             legacy: env["OCR_HTTP_TILE_MIN_TEXT_FRAC"]
         )
         let openAIModel = try parseOpenAIModel(env["OCR_HTTP_OPENAI_MODEL"])
+        let debugCaptureDir = try parseDebugCaptureDir(env["OCR_HTTP_DEBUG_CAPTURE_DIR"])
+        let debugCaptureMax = clampedEnv(
+            "OCR_HTTP_DEBUG_CAPTURE_MAX",
+            default: defaultDebugCaptureMax,
+            min: 1,
+            max: 10_000
+        )
         return AppConfig(
             hosts: hosts,
             port: port,
@@ -87,7 +98,9 @@ struct AppConfig: Sendable {
             queueMax: queueMax,
             queueTimeoutMs: queueTimeoutMs,
             tileMinGlyphFrac: tileMinGlyphFrac,
-            openAIModel: openAIModel
+            openAIModel: openAIModel,
+            debugCaptureDir: debugCaptureDir,
+            debugCaptureMax: debugCaptureMax
         )
     }
 }
@@ -198,6 +211,8 @@ private func printUsage() {
       OCR_HTTP_TILE_MIN_GLYPH_FRAC  scale=auto glyph/long-side threshold, 0.001...0.2 (default: \(AppConfig.defaultTileMinGlyphFrac))
       OCR_HTTP_TILE_MIN_TEXT_FRAC   deprecated alias of OCR_HTTP_TILE_MIN_GLYPH_FRAC
       OCR_HTTP_OPENAI_MODEL     Model id for GET /v1/models (default: \(AppConfig.defaultOpenAIModel))
+      OCR_HTTP_DEBUG_CAPTURE_DIR  When set, store OCR inputs and a redacted sidecar (default: off)
+      OCR_HTTP_DEBUG_CAPTURE_MAX  How many captures to keep, 1...10000 (default: \(AppConfig.defaultDebugCaptureMax))
 
     """
     fputs(text, stdout)
@@ -240,6 +255,15 @@ private func loadToken() throws -> String {
         throw ConfigError("refusing placeholder OCR_HTTP_TOKEN")
     }
     return token
+}
+
+func parseDebugCaptureDir(_ raw: String?) throws -> String? {
+    let text = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if text.isEmpty { return nil }
+    if text.contains("\n") || text.contains("\u{0000}") || text.contains("__") {
+        throw ConfigError("OCR_HTTP_DEBUG_CAPTURE_DIR must not contain newlines, NULs, or __")
+    }
+    return text
 }
 
 func parseTileMinGlyphFrac(_ raw: String?, legacy: String?) throws -> Double {

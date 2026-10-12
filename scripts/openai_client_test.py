@@ -161,17 +161,28 @@ def main():
     else:
         sys.exit("https image url was accepted")
 
-    try:
-        client.chat.completions.create(
-            model=args.model,
-            messages=[{"role": "user", "content": "no image"}],
-        )
-    except BadRequestError as error:
-        if error.status_code != 400:
-            sys.exit(f"missing image status {error.status_code}")
-        print("rejected text-only request")
-    else:
-        sys.exit("text-only request was accepted")
+    plain = client.chat.completions.create(
+        model=args.model,
+        messages=[{"role": "user", "content": "no image"}],
+    )
+    plain_text = plain.choices[0].message.content
+    if plain_text != "":
+        sys.exit(f"text-only content is {plain_text!r}")
+    streamed_probe = []
+    probe = client.chat.completions.create(
+        model=args.model,
+        stream=True,
+        messages=[{"role": "user", "content": "no image"}],
+    )
+    for chunk in probe:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta.content
+        if delta:
+            streamed_probe.append(delta)
+    if "".join(streamed_probe) != "":
+        sys.exit(f"text-only stream is {''.join(streamed_probe)!r}")
+    print("text-only 200 empty (stream and non-stream)")
 
     print("openai client test ok")
 

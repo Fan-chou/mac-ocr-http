@@ -16,6 +16,8 @@ struct HTTPResponse {
     var reason: String
     var headers: [String: String]
     var body: Data
+    /// Error code for the stdout line. Not written on the wire.
+    var logCode: String? = nil
 
     static func json<T: Encodable>(
         _ status: Int,
@@ -57,7 +59,7 @@ struct HTTPResponse {
 enum HTTPReadError: Error {
     case malformed(String)
     case headersTooLarge
-    case bodyTooLarge(path: String)
+    case bodyTooLarge(method: String, path: String)
     case lengthRequired
     case timeout
     case closed
@@ -69,7 +71,7 @@ enum HTTPReadError: Error {
             return HTTPResponse.json(400, ErrorBody(ok: false, error: message))
         case .headersTooLarge:
             return HTTPResponse.json(400, ErrorBody(ok: false, error: "headers too large"))
-        case .bodyTooLarge(_):
+        case .bodyTooLarge:
             return HTTPResponse.json(413, ErrorBody(ok: false, error: "request body exceeds limit"))
         case .lengthRequired:
             return HTTPResponse.json(411, ErrorBody(ok: false, error: "Content-Length required"))
@@ -112,7 +114,7 @@ enum HTTPReader {
         let length: Int
         if let contentLength = head.contentLength {
             if contentLength > maxBodyBytes {
-                throw HTTPReadError.bodyTooLarge(path: head.path)
+                throw HTTPReadError.bodyTooLarge(method: head.method, path: head.path)
             }
             length = contentLength
         } else if head.method == "POST" {

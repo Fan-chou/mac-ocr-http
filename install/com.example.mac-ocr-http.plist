@@ -32,6 +32,10 @@
 		<string>__QUEUE_TIMEOUT_MS__</string>
 		<key>OCR_HTTP_OPENAI_MODEL</key>
 		<string>__OPENAI_MODEL__</string>
+		<key>OCR_HTTP_DEBUG_CAPTURE_DIR</key>
+		<string>__DEBUG_CAPTURE_DIR__</string>
+		<key>OCR_HTTP_DEBUG_CAPTURE_MAX</key>
+		<string>__DEBUG_CAPTURE_MAX__</string>
 	</dict>
 	<key>StandardOutPath</key>
 	<string>__STDOUT__</string>

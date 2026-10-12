@@ -24,6 +24,11 @@ if ! [[ "$OPENAI_MODEL" =~ ^[A-Za-z0-9._:/-]{1,128}$ ]]; then
   echo "OCR_HTTP_OPENAI_MODEL must be 1...128 characters from [A-Za-z0-9._:/-]" >&2
   exit 1
 fi
+DEBUG_CAPTURE_DIR="${OCR_HTTP_DEBUG_CAPTURE_DIR:-}"
+if [[ "$DEBUG_CAPTURE_DIR" == *$'\n'* || "$DEBUG_CAPTURE_DIR" == *"__"* ]]; then
+  echo "OCR_HTTP_DEBUG_CAPTURE_DIR must not contain newlines or __" >&2
+  exit 1
+fi
 HOSTS_RAW="${OCR_HTTP_HOST:-127.0.0.1}"
 if ! [[ "$LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,200}$ ]]; then
   echo "OCR_HTTP_LABEL must be a launchd label such as com.example.mac-ocr-http" >&2
@@ -91,6 +96,7 @@ fi
 VISION_WORKERS="$(take_int OCR_HTTP_VISION_WORKERS "${OCR_HTTP_VISION_WORKERS:-2}" 1 4)"
 QUEUE_MAX="$(take_int OCR_HTTP_QUEUE_MAX "${OCR_HTTP_QUEUE_MAX:-64}" 1 256)"
 QUEUE_TIMEOUT_MS="$(take_int OCR_HTTP_QUEUE_TIMEOUT_MS "${OCR_HTTP_QUEUE_TIMEOUT_MS:-180000}" 1 300000)"
+DEBUG_CAPTURE_MAX="$(take_int OCR_HTTP_DEBUG_CAPTURE_MAX "${OCR_HTTP_DEBUG_CAPTURE_MAX:-50}" 1 10000)"
 
 command -v swift >/dev/null || { echo "swift not found; install Xcode or the Command Line Tools" >&2; exit 1; }
 command -v openssl >/dev/null || { echo "openssl not found" >&2; exit 1; }
@@ -145,6 +151,8 @@ WORKERS_ESC="$(xml_escape "$VISION_WORKERS")"
 QUEUE_ESC="$(xml_escape "$QUEUE_MAX")"
 TIMEOUT_ESC="$(xml_escape "$QUEUE_TIMEOUT_MS")"
 MODEL_ESC="$(xml_escape "$OPENAI_MODEL")"
+DEBUG_DIR_ESC="$(xml_escape "$DEBUG_CAPTURE_DIR")"
+DEBUG_MAX_ESC="$(xml_escape "$DEBUG_CAPTURE_MAX")"
 OUT_ESC="$(xml_escape "${LOG_DIR}/stdout.log")"
 ERR_ESC="$(xml_escape "${LOG_DIR}/stderr.log")"
 
@@ -157,6 +165,8 @@ text="${text//__VISION_WORKERS__/${WORKERS_ESC}}"
 text="${text//__QUEUE_MAX__/${QUEUE_ESC}}"
 text="${text//__QUEUE_TIMEOUT_MS__/${TIMEOUT_ESC}}"
 text="${text//__OPENAI_MODEL__/${MODEL_ESC}}"
+text="${text//__DEBUG_CAPTURE_DIR__/${DEBUG_DIR_ESC}}"
+text="${text//__DEBUG_CAPTURE_MAX__/${DEBUG_MAX_ESC}}"
 text="${text//__STDOUT__/${OUT_ESC}}"
 text="${text//__STDERR__/${ERR_ESC}}"
 text="${text//__LABEL__/${LABEL}}"
@@ -165,7 +175,7 @@ umask 077
 printf '%s\n' "$text" > "$PLIST_DST"
 chmod 600 "$PLIST_DST"
 
-if grep -E -q '__(BINARY|TOKEN|PORT|WORKDIR|STDOUT|STDERR|HOST|LABEL|VISION_WORKERS|QUEUE_MAX|QUEUE_TIMEOUT_MS|OPENAI_MODEL)__' "$PLIST_DST"; then
+if grep -E -q '__(BINARY|TOKEN|PORT|WORKDIR|STDOUT|STDERR|HOST|LABEL|VISION_WORKERS|QUEUE_MAX|QUEUE_TIMEOUT_MS|OPENAI_MODEL|DEBUG_CAPTURE_DIR|DEBUG_CAPTURE_MAX)__' "$PLIST_DST"; then
   echo "plist still contains placeholders" >&2
   exit 1
 fi

@@ -53,6 +53,8 @@ Token lookup order: `OCR_HTTP_TOKEN`, then `OCR_HTTP_TOKEN_FILE`, then `~/Librar
 | `OCR_HTTP_QUEUE_TIMEOUT_MS` | `180000` (clamped to 1–300000) |
 | `OCR_HTTP_TILE_MIN_GLYPH_FRAC` | `0.012` (clamped to 0.001–0.2). `scale=auto` tiles when glyph size / long side is below this. `OCR_HTTP_TILE_MIN_TEXT_FRAC` is a deprecated alias, used only when the new variable is unset. |
 | `OCR_HTTP_OPENAI_MODEL` | `mac-ocr`. The id returned by `GET /v1/models`. A chat request may name any model; the response echoes that name. |
+| `OCR_HTTP_DEBUG_CAPTURE_DIR` | Unset. Off unless this is a directory path. See [Debug capture](#debug-capture). |
+| `OCR_HTTP_DEBUG_CAPTURE_MAX` | `50` (clamped to 1–10000). How many captures to keep. |
 
 ## Install the LaunchAgent
 
@@ -210,7 +212,11 @@ Base URL `http://127.0.0.1:8741/v1` (or `http://192.168.1.50:8741/v1` on the LAN
 | `POST` | `/v1/responses` | Same OCR, Responses API shape (`output_text` and `output[].content[].text`). `stream: true` sends `response.output_text.delta`, then `response.completed`, then `data: [DONE]`. |
 | `OPTIONS` | `/v1/*` | CORS preflight, no token, no body. |
 
-**Which images.** Every `image_url` in the last `user` message, in part order. `image_url` may be `{"url":"data:image/png;base64,…","detail":"high"}` or a plain string (some clients send the string). `input_image` is accepted too. When that user message has no image, every image in the conversation is used, including system, developer, and assistant messages. Several images are recognized one after another on the same worker and joined with a blank line. No image is HTTP 400 `{"error":{"message","type":"invalid_request_error","param","code":"missing_image"}}`.
+**Which images.** Every `image_url` in the last `user` message, in part order. `image_url` may be `{"url":"data:image/png;base64,…","detail":"high"}` or a plain string (some clients send the string). `input_image` is accepted too. When that user message has no image, every image in the conversation is used, including system, developer, and assistant messages. Several images are recognized one after another on the same worker and joined with a blank line.
+
+A request with no image at all is still HTTP 200, streaming or not, with `content` (and Responses `output_text`) set to an empty string. It does not enter the Vision queue. STranslate's Validate button ([`SettingsViewModel.ValidateAsync`](https://github.com/STranslate/STranslate/blob/main/src/Plugins/STranslate.Plugin.Ocr.OpenAI/ViewModel/SettingsViewModel.cs)) posts the enabled prompt as string messages with `stream: true` and no image, then calls `StreamPostAsync` and treats any non-2xx as failure. The callback discards each line, so the content does not have to be non-empty. An `http:`/`https:`/`file:` image, undecodable base64, or a non-image data URL is still HTTP 400.
+
+A 4xx or 5xx on `/v1/*` is one stdout line: `METHOD /v1/... STATUS code`. The code is the error `code` field (`invalid_image_url`, `invalid_base64`, `queue_full`, `request_too_large`, …). The line does not include the body, the token, or the query string.
 
 Text is not a prompt. `temperature`, `top_p`, `n` (the reply is always one choice), `max_tokens`, `max_completion_tokens`, `stop`, penalties, `user`, `tools`, `seed`, `logprobs`, `response_format`, `stream_options` (except `include_usage`), `reasoning_effort`, `thinking`, and unknown fields are ignored. `response_format: json_object` still returns plain text. The only hint that is read is a line `ocr-language: <tag>` or `recognition-language: <tag>` in any text part. The tag must be `zh` / `zh-Hans`, `zh-Hant`, `en` / `en-US`, `ja` / `ja-JP`, or `ko` / `ko-KR`. Anything else is ignored. Recognition then uses the default pipeline: `scale=auto`, accurate, `zh-Hans`+`en-US` unless that hint replaced the list, and `script=hans` when Simplified Chinese is first.
 
@@ -224,9 +230,10 @@ Queue full and queue timeout stay **503** with `Retry-After: 1` and `"type":"ser
 
 **What those apps actually send**
 
-- Bob's LLM OCR plugin ([`Henry-Jessie/bob-plugin-llm-ocr` `src/main.js`](https://github.com/Henry-Jessie/bob-plugin-llm-ocr/blob/main/src/main.js)) POSTs `{base}{path}` with `Authorization: Bearer`, a system string, and a user content array: a text part plus `image_url.url` set to `data:image/jpeg;base64,…`. It reads `choices[0].message.content` and does not stream. API URL `http://127.0.0.1:8741`, path `/v1/chat/completions`, model `mac-ocr`. The OpenAI *translate* plugin ([`nextai-translator/bob-plugin-openai-translator` `src/adapter/openai.ts`](https://github.com/nextai-translator/bob-plugin-openai-translator/blob/main/src/adapter/openai.ts)) sends text only (`messages` strings, or Responses `instructions` + `input` string). That request has no image and gets 400. Point Bob's OCR plugin here, not the translator, when you want OCR.
-- Easydict's custom OpenAI service ([`BaseOpenAIService.swift`](https://github.com/tisfeng/Easydict/blob/main/Easydict/Swift/Service/OpenAI/BaseOpenAIService.swift)) encodes a MacPaw `ChatQuery`: string `messages`, `model`, `temperature`, `stream`, and both `Authorization: Bearer` and `api-key`. Streaming requires `Content-Type: text/event-stream` and reads `choices[0].delta.content`; a JSON content type makes it fall back to one-shot. `GET` `…/models` expects `data[].id`. Its built-in OCR is the system OCR, then the text is translated, so a normal Easydict lookup has no image and gets 400. Set the endpoint to `http://127.0.0.1:8741/v1/chat/completions`, the key to the token, and the model to `mac-ocr` only for a client path that attaches an image.
-- Immersive Translate's custom OpenAI field wants the chat URL. Use `http://127.0.0.1:8741/v1/chat/completions`, or a base ending in `/v1` on versions that append `/chat/completions` themselves. API key is the token. Model `mac-ocr`. Page translation sends text batches and gets 400; an image request that uses `image_url` data URLs is the one this server answers. Their docs for a local model tell you to open CORS (`OLLAMA_ORIGINS=*`), which is why `/v1/*` answers preflight.
+- Bob's LLM OCR plugin ([`Henry-Jessie/bob-plugin-llm-ocr` `src/main.js`](https://github.com/Henry-Jessie/bob-plugin-llm-ocr/blob/main/src/main.js)) POSTs `{base}{path}` with `Authorization: Bearer`, a system string, and a user content array: a text part plus `image_url.url` set to `data:image/jpeg;base64,…`. It reads `choices[0].message.content` and does not stream. API URL `http://127.0.0.1:8741`, path `/v1/chat/completions`, model `mac-ocr`. The OpenAI *translate* plugin ([`nextai-translator/bob-plugin-openai-translator` `src/adapter/openai.ts`](https://github.com/nextai-translator/bob-plugin-openai-translator/blob/main/src/adapter/openai.ts)) sends text only. That request gets an empty 200, not recognized text. Point Bob's OCR plugin here when you want OCR.
+- Easydict's custom OpenAI service ([`BaseOpenAIService.swift`](https://github.com/tisfeng/Easydict/blob/main/Easydict/Swift/Service/OpenAI/BaseOpenAIService.swift)) encodes a MacPaw `ChatQuery`: string `messages`, `model`, `temperature`, `stream`, and both `Authorization: Bearer` and `api-key`. Streaming requires `Content-Type: text/event-stream` and reads `choices[0].delta.content`; a JSON content type makes it fall back to one-shot. `GET` `…/models` expects `data[].id`. Its built-in OCR is the system OCR. A text-only lookup gets an empty completion. Set the endpoint to `http://127.0.0.1:8741/v1/chat/completions`, the key to the token, and the model to `mac-ocr` for a client path that attaches an image.
+- Immersive Translate's custom OpenAI field wants the chat URL. Use `http://127.0.0.1:8741/v1/chat/completions`, or a base ending in `/v1` on versions that append `/chat/completions` themselves. API key is the token. Model `mac-ocr`. Page translation sends text batches and gets an empty completion; an image request that uses `image_url` data URLs is the one this server answers. Their docs for a local model tell you to open CORS (`OLLAMA_ORIGINS=*`), which is why `/v1/*` answers preflight.
+- STranslate's OpenAI OCR plugin ([`Main.RecognizeAsync`](https://github.com/STranslate/STranslate/blob/main/src/Plugins/STranslate.Plugin.Ocr.OpenAI/Main.cs)) does not stream. Earlier prompt items are `{role, content}` strings. The last user message is a content array: a text part, then `image_url.url` set to `data:image/jpeg;base64,…` (low quality) or `data:image/png;base64,…` (medium). High quality is rejected in the plugin before the request. It reads `choices[0].message.content` and splits on newlines. `UrlHelper.BuildFinalUrl` turns a base of `http://127.0.0.1:8741/` or `http://127.0.0.1:8741/v1` into `http://127.0.0.1:8741/v1/chat/completions`. Validate is the text-only stream described above. Model `mac-ocr`, API key the token, temperature is ignored.
 
 ```bash
 TOKEN="$(cat "${HOME}/Library/Application Support/MacOcrHttp/token")"
@@ -251,7 +258,17 @@ curl -N -sS -H "Authorization: Bearer ${TOKEN}" \
 pip install openai
 OCR_HTTP_TOKEN="$(cat "${HOME}/Library/Application Support/MacOcrHttp/token")" \
   python3 scripts/openai_client_test.py
-``` A request that finds a free worker, or a free queue slot, is not rejected. Vision work runs on `OCR_HTTP_VISION_WORKERS` serial queues (default 2), not an unbounded GCD fan-out. Connection threads are capped at queue size + worker count + 16, shared across all listen addresses, so every queued request has a thread and that thread blocks on a condition instead of spinning. `GET /health` does not enter the OCR queue; the extra 16 slots keep it from waiting out a full queue.
+```
+
+## Debug capture
+
+Off by default. Set `OCR_HTTP_DEBUG_CAPTURE_DIR` to a directory and the server stores every OCR request from `POST /ocr`, `POST /v1/chat/completions`, and `POST /v1/responses` there. This is a debugging aid: it writes the user's images to disk.
+
+Each request gets a numbered directory with the decoded image bytes (`image-0.png`, `image-0.jpg`, …) and a `meta.json` sidecar: timestamp, endpoint, client IP, status, error code, elapsedMs, mode, tiles, glyphFrac, the returned text and rows, and for `/v1` a summary of the messages (role, text parts, image count). The directory is mode `0700` and the files are mode `0600`. `OCR_HTTP_DEBUG_CAPTURE_MAX` (default 50) is a ring buffer; older directories are deleted.
+
+The sidecar keeps the text prompt. It does not keep the `Authorization` header, the token, query keys, or the raw base64. A text-only Validate request is stored too, with empty text and no image file. Writes run on a background queue. A disk error is logged as `debug capture failed` and the OCR response is unchanged.
+
+`scripts/install.sh` copies the two variables into the LaunchAgent plist. Leave the directory unset to keep capture off.
 
 ## curl
 
