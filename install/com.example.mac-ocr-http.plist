@@ -30,6 +30,8 @@
 		<string>__QUEUE_MAX__</string>
 		<key>OCR_HTTP_QUEUE_TIMEOUT_MS</key>
 		<string>__QUEUE_TIMEOUT_MS__</string>
+		<key>OCR_HTTP_OPENAI_MODEL</key>
+		<string>__OPENAI_MODEL__</string>
 	</dict>
 	<key>StandardOutPath</key>
 	<string>__STDOUT__</string>

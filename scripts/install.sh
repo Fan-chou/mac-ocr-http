@@ -19,6 +19,11 @@ TOKEN_FILE="${APP_SUPPORT}/token"
 BIN_DST="${APP_SUPPORT}/mac-ocr-http"
 TEMPLATE="${ROOT}/install/com.example.mac-ocr-http.plist"
 PORT="${OCR_HTTP_PORT:-8741}"
+OPENAI_MODEL="${OCR_HTTP_OPENAI_MODEL:-mac-ocr}"
+if ! [[ "$OPENAI_MODEL" =~ ^[A-Za-z0-9._:/-]{1,128}$ ]]; then
+  echo "OCR_HTTP_OPENAI_MODEL must be 1...128 characters from [A-Za-z0-9._:/-]" >&2
+  exit 1
+fi
 HOSTS_RAW="${OCR_HTTP_HOST:-127.0.0.1}"
 if ! [[ "$LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,200}$ ]]; then
   echo "OCR_HTTP_LABEL must be a launchd label such as com.example.mac-ocr-http" >&2
@@ -139,6 +144,7 @@ HOST_ESC="$(xml_escape "$HOSTS")"
 WORKERS_ESC="$(xml_escape "$VISION_WORKERS")"
 QUEUE_ESC="$(xml_escape "$QUEUE_MAX")"
 TIMEOUT_ESC="$(xml_escape "$QUEUE_TIMEOUT_MS")"
+MODEL_ESC="$(xml_escape "$OPENAI_MODEL")"
 OUT_ESC="$(xml_escape "${LOG_DIR}/stdout.log")"
 ERR_ESC="$(xml_escape "${LOG_DIR}/stderr.log")"
 
@@ -150,6 +156,7 @@ text="${text//__HOST__/${HOST_ESC}}"
 text="${text//__VISION_WORKERS__/${WORKERS_ESC}}"
 text="${text//__QUEUE_MAX__/${QUEUE_ESC}}"
 text="${text//__QUEUE_TIMEOUT_MS__/${TIMEOUT_ESC}}"
+text="${text//__OPENAI_MODEL__/${MODEL_ESC}}"
 text="${text//__STDOUT__/${OUT_ESC}}"
 text="${text//__STDERR__/${ERR_ESC}}"
 text="${text//__LABEL__/${LABEL}}"
@@ -158,7 +165,7 @@ umask 077
 printf '%s\n' "$text" > "$PLIST_DST"
 chmod 600 "$PLIST_DST"
 
-if grep -E -q '__(BINARY|TOKEN|PORT|WORKDIR|STDOUT|STDERR|HOST|LABEL|VISION_WORKERS|QUEUE_MAX|QUEUE_TIMEOUT_MS)__' "$PLIST_DST"; then
+if grep -E -q '__(BINARY|TOKEN|PORT|WORKDIR|STDOUT|STDERR|HOST|LABEL|VISION_WORKERS|QUEUE_MAX|QUEUE_TIMEOUT_MS|OPENAI_MODEL)__' "$PLIST_DST"; then
   echo "plist still contains placeholders" >&2
   exit 1
 fi

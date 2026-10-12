@@ -15,6 +15,8 @@ struct AppConfig: Sendable {
     var queueTimeoutMs: Int
     /// `scale=auto`: tile when glyph size / long side is below this.
     var tileMinGlyphFrac: Double
+    /// Model id listed by `GET /v1/models`. Chat requests may send any model string.
+    var openAIModel: String
 
     static let defaultHosts = ["127.0.0.1"]
     static let defaultPort: UInt16 = 8741
@@ -25,6 +27,7 @@ struct AppConfig: Sendable {
     static let defaultQueueMax = 64
     static let defaultQueueTimeoutMs = 180_000
     static let defaultTileMinGlyphFrac = TilePolicy.defaultMinGlyphFrac
+    static let defaultOpenAIModel = "mac-ocr"
 
     static func load() throws -> AppConfig {
         let hostArgument = try parseArguments()
@@ -72,6 +75,7 @@ struct AppConfig: Sendable {
             env["OCR_HTTP_TILE_MIN_GLYPH_FRAC"],
             legacy: env["OCR_HTTP_TILE_MIN_TEXT_FRAC"]
         )
+        let openAIModel = try parseOpenAIModel(env["OCR_HTTP_OPENAI_MODEL"])
         return AppConfig(
             hosts: hosts,
             port: port,
@@ -82,7 +86,8 @@ struct AppConfig: Sendable {
             visionWorkers: visionWorkers,
             queueMax: queueMax,
             queueTimeoutMs: queueTimeoutMs,
-            tileMinGlyphFrac: tileMinGlyphFrac
+            tileMinGlyphFrac: tileMinGlyphFrac,
+            openAIModel: openAIModel
         )
     }
 }
@@ -192,6 +197,7 @@ private func printUsage() {
       OCR_HTTP_QUEUE_TIMEOUT_MS Queue wait, 1...300000 ms (default: \(AppConfig.defaultQueueTimeoutMs))
       OCR_HTTP_TILE_MIN_GLYPH_FRAC  scale=auto glyph/long-side threshold, 0.001...0.2 (default: \(AppConfig.defaultTileMinGlyphFrac))
       OCR_HTTP_TILE_MIN_TEXT_FRAC   deprecated alias of OCR_HTTP_TILE_MIN_GLYPH_FRAC
+      OCR_HTTP_OPENAI_MODEL     Model id for GET /v1/models (default: \(AppConfig.defaultOpenAIModel))
 
     """
     fputs(text, stdout)
@@ -247,6 +253,22 @@ func parseTileMinGlyphFrac(_ raw: String?, legacy: String?) throws -> Double {
         return try parseGlyphFrac(old, name: "OCR_HTTP_TILE_MIN_TEXT_FRAC")
     }
     return AppConfig.defaultTileMinGlyphFrac
+}
+
+func parseOpenAIModel(_ raw: String?) throws -> String {
+    let text = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if text.isEmpty { return AppConfig.defaultOpenAIModel }
+    let allowed = text.unicodeScalars.allSatisfy { scalar in
+        let value = scalar.value
+        return (0x30...0x39).contains(value)
+            || (0x41...0x5A).contains(value)
+            || (0x61...0x7A).contains(value)
+            || value == 0x2E || value == 0x5F || value == 0x2D || value == 0x3A || value == 0x2F
+    }
+    guard text.count <= 128, allowed else {
+        throw ConfigError("OCR_HTTP_OPENAI_MODEL must be 1...128 characters from [A-Za-z0-9._:/-]")
+    }
+    return text
 }
 
 private func parseGlyphFrac(_ text: String, name: String) throws -> Double {

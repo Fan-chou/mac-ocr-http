@@ -11,9 +11,9 @@ This tree compiles with the native Swift build system on macOS 13 or newer. On a
 ## Security
 
 - Listen addresses come from `OCR_HTTP_HOST` (or `--host`, same rules): a comma-separated list of IPv4 literals, default `127.0.0.1`. Only `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16` are accepted. `0.0.0.0`, `*`, hostnames, IPv6 and public addresses are a fatal config error. One socket is bound per address, and `getsockname` must return exactly that address.
-- `GET /health` is open. `GET /languages`, `GET /stats`, and `POST /ocr` require `Authorization: Bearer <token>` on every address, LAN included. Anyone on the LAN who has the token can OCR; treat it like a password.
-- The server never reads a filesystem path and never fetches a URL. JSON fields `path`, `url`, `image_url`, and `file` are rejected when they are the image source.
-- Chunked `Transfer-Encoding` is rejected. Send `Content-Length` (curl does).
+- `GET /health` is open. `GET /languages`, `GET /stats`, `POST /ocr`, and `/v1/*` require `Authorization: Bearer <token>` on every address, LAN included. `OPTIONS /v1/*` is an unauthenticated CORS preflight and returns no data. Anyone on the LAN who has the token can OCR; treat it like a password.
+- The server never reads a filesystem path and never fetches a URL. On `POST /ocr`, JSON fields `path`, `url`, `image_url`, and `file` are rejected. On `/v1/*`, `image_url` is accepted only as a `data:` base64 URL; `http:`, `https:`, and `file:` are rejected with HTTP 400.
+- Chunked `Transfer-Encoding` on a request is rejected. Send `Content-Length` (curl does). A `stream: true` response is chunked HTTP/1.1; that is the server writing, not the client.
 - Call `http://127.0.0.1:8741`, not `localhost`. `localhost` may resolve to `::1`, and this process does not listen there.
 
 ## Requirements
@@ -52,6 +52,7 @@ Token lookup order: `OCR_HTTP_TOKEN`, then `OCR_HTTP_TOKEN_FILE`, then `~/Librar
 | `OCR_HTTP_QUEUE_MAX` | `64` (clamped to 1–256). Requests wait for a worker instead of failing immediately. |
 | `OCR_HTTP_QUEUE_TIMEOUT_MS` | `180000` (clamped to 1–300000) |
 | `OCR_HTTP_TILE_MIN_GLYPH_FRAC` | `0.012` (clamped to 0.001–0.2). `scale=auto` tiles when glyph size / long side is below this. `OCR_HTTP_TILE_MIN_TEXT_FRAC` is a deprecated alias, used only when the new variable is unset. |
+| `OCR_HTTP_OPENAI_MODEL` | `mac-ocr`. The id returned by `GET /v1/models`. A chat request may name any model; the response echoes that name. |
 
 ## Install the LaunchAgent
 
@@ -193,7 +194,64 @@ Errors use a non-200 status and `{"ok":false,"error":"..."}`: `400` bad input (i
 {"ok":false,"error":"image too large","maxPixels":100000000,"width":12000,"height":9000}
 ```
 
-Dimensions are read from the image header before the bitmap is allocated. `503` with `Retry-After: 1` means the wait queue is already full (`"queue full"`) or the caller waited `OCR_HTTP_QUEUE_TIMEOUT_MS` without a free worker (`"queue wait timed out"`). A request that finds a free worker, or a free queue slot, is not rejected. Vision work runs on `OCR_HTTP_VISION_WORKERS` serial queues (default 2), not an unbounded GCD fan-out. Connection threads are capped at queue size + worker count + 16, shared across all listen addresses, so every queued request has a thread and that thread blocks on a condition instead of spinning. `GET /health` does not enter the OCR queue; the extra 16 slots keep it from waiting out a full queue.
+Dimensions are read from the image header before the bitmap is allocated. `503` with `Retry-After: 1` means the wait queue is already full (`"queue full"`) or the caller waited `OCR_HTTP_QUEUE_TIMEOUT_MS` without a free worker (`"queue wait timed out"`). `/v1/*` uses the same 503 and `Retry-After`, with an OpenAI error object instead of `{"ok":false}`. A request that finds a free worker, or a free queue slot, is not rejected. Vision work runs on `OCR_HTTP_VISION_WORKERS` serial queues (default 2), not an unbounded GCD fan-out. Connection threads are capped at queue size + worker count + 16, shared across all listen addresses, so every queued request has a thread and that thread blocks on a condition instead of spinning. `GET /health` does not enter the OCR queue; the extra 16 slots keep it from waiting out a full queue.
+
+## OpenAI-compatible API
+
+`/health`, `/languages`, `/stats`, and `/ocr` are unchanged. These routes are an extra way to OCR, for apps that only know a custom OpenAI endpoint.
+
+Base URL `http://127.0.0.1:8741/v1` (or `http://192.168.1.50:8741/v1` on the LAN). API key is the bearer token. Model id is `mac-ocr` unless `OCR_HTTP_OPENAI_MODEL` is set. The server does not call OpenAI.
+
+| Method | Path | |
+|---|---|---|
+| `GET` | `/v1/models` | `{"object":"list","data":[{"id":"mac-ocr","object":"model","created":…,"owned_by":"mac-ocr-http"}]}` |
+| `GET` | `/v1/models/{id}` | That object, or 404 when `{id}` is not the configured model. |
+| `POST` | `/v1/chat/completions` | OCR, then one `chat.completion`. `stream: true` is SSE. |
+| `POST` | `/v1/responses` | Same OCR, Responses API shape (`output_text` and `output[].content[].text`). `stream: true` sends `response.output_text.delta`, then `response.completed`, then `data: [DONE]`. |
+| `OPTIONS` | `/v1/*` | CORS preflight, no token, no body. |
+
+**Which images.** Every `image_url` in the last `user` message, in part order. `image_url` may be `{"url":"data:image/png;base64,…","detail":"high"}` or a plain string (some clients send the string). `input_image` is accepted too. When that user message has no image, every image in the conversation is used, including system, developer, and assistant messages. Several images are recognized one after another on the same worker and joined with a blank line. No image is HTTP 400 `{"error":{"message","type":"invalid_request_error","param","code":"missing_image"}}`.
+
+Text is not a prompt. `temperature`, `top_p`, `n` (the reply is always one choice), `max_tokens`, `max_completion_tokens`, `stop`, penalties, `user`, `tools`, `seed`, `logprobs`, `response_format`, `stream_options` (except `include_usage`), `reasoning_effort`, `thinking`, and unknown fields are ignored. `response_format: json_object` still returns plain text. The only hint that is read is a line `ocr-language: <tag>` or `recognition-language: <tag>` in any text part. The tag must be `zh` / `zh-Hans`, `zh-Hant`, `en` / `en-US`, `ja` / `ja-JP`, or `ko` / `ko-KR`. Anything else is ignored. Recognition then uses the default pipeline: `scale=auto`, accurate, `zh-Hans`+`en-US` unless that hint replaced the list, and `script=hans` when Simplified Chinese is first.
+
+`model` may be any string and is copied into the response. If it is omitted, the configured id is used. `usage.prompt_tokens` is the Unicode scalar count of the text parts (images are not tokenized). `completion_tokens` is the scalar count of the OCR text. `total_tokens` is the sum. These are not BPE tokens. `system_fingerprint` is the constant `fp_macocr`.
+
+`stream: true` runs OCR to completion, then writes SSE. The status line is sent only after OCR succeeds, so a bad request, a full queue, or a Vision error is a normal JSON body with its real status, never HTTP 200. HTTP/1.1 uses `Transfer-Encoding: chunked`. HTTP/1.0 writes the same events and the connection close ends the body. Chat chunks are: `delta.role = assistant`, then one chunk per output line (a blank line is its own chunk), then `finish_reason: stop`. When `stream_options.include_usage` is true, one more chunk has `"choices":[]` and `usage`. The stream ends with `data: [DONE]`.
+
+Queue full and queue timeout stay **503** with `Retry-After: 1` and `"type":"server_error"`. An image over the pixel cap is **413**. A missing or wrong token is **401** `code: invalid_api_key`. The shared body cap is also **413**; on `/v1/*` that body is the OpenAI error object (`code: request_too_large`). `/ocr` still returns `{"ok":false,"error":"request body exceeds limit"}`.
+
+**CORS.** `Access-Control-Allow-Origin: *` is set only on `/v1/*`, together with `GET, POST, OPTIONS` and `Authorization, Content-Type, Accept` (plus any extra preflight header names that are a single token). `Access-Control-Allow-Credentials` is not set. Immersive Translate's own Ollama note (`OLLAMA_ORIGINS=*`) shows that the extension's custom-endpoint fetch is subject to CORS, so a localhost OpenAI URL without these headers fails in the browser. A web page still cannot call the API unless it already has the bearer token: the browser will not attach the token file, and there is no cookie. `/ocr`, `/stats`, and `/languages` send no CORS headers. The header `api-key` (Easydict sends it next to `Authorization`) is ignored; the bearer token is what is checked.
+
+**What those apps actually send**
+
+- Bob's LLM OCR plugin ([`Henry-Jessie/bob-plugin-llm-ocr` `src/main.js`](https://github.com/Henry-Jessie/bob-plugin-llm-ocr/blob/main/src/main.js)) POSTs `{base}{path}` with `Authorization: Bearer`, a system string, and a user content array: a text part plus `image_url.url` set to `data:image/jpeg;base64,…`. It reads `choices[0].message.content` and does not stream. API URL `http://127.0.0.1:8741`, path `/v1/chat/completions`, model `mac-ocr`. The OpenAI *translate* plugin ([`nextai-translator/bob-plugin-openai-translator` `src/adapter/openai.ts`](https://github.com/nextai-translator/bob-plugin-openai-translator/blob/main/src/adapter/openai.ts)) sends text only (`messages` strings, or Responses `instructions` + `input` string). That request has no image and gets 400. Point Bob's OCR plugin here, not the translator, when you want OCR.
+- Easydict's custom OpenAI service ([`BaseOpenAIService.swift`](https://github.com/tisfeng/Easydict/blob/main/Easydict/Swift/Service/OpenAI/BaseOpenAIService.swift)) encodes a MacPaw `ChatQuery`: string `messages`, `model`, `temperature`, `stream`, and both `Authorization: Bearer` and `api-key`. Streaming requires `Content-Type: text/event-stream` and reads `choices[0].delta.content`; a JSON content type makes it fall back to one-shot. `GET` `…/models` expects `data[].id`. Its built-in OCR is the system OCR, then the text is translated, so a normal Easydict lookup has no image and gets 400. Set the endpoint to `http://127.0.0.1:8741/v1/chat/completions`, the key to the token, and the model to `mac-ocr` only for a client path that attaches an image.
+- Immersive Translate's custom OpenAI field wants the chat URL. Use `http://127.0.0.1:8741/v1/chat/completions`, or a base ending in `/v1` on versions that append `/chat/completions` themselves. API key is the token. Model `mac-ocr`. Page translation sends text batches and gets 400; an image request that uses `image_url` data URLs is the one this server answers. Their docs for a local model tell you to open CORS (`OLLAMA_ORIGINS=*`), which is why `/v1/*` answers preflight.
+
+```bash
+TOKEN="$(cat "${HOME}/Library/Application Support/MacOcrHttp/token")"
+B64="$(base64 < page.png | tr -d '\n')"
+
+curl -sS -H "Authorization: Bearer ${TOKEN}" http://127.0.0.1:8741/v1/models
+
+curl -sS -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"mac-ocr\",\"messages\":[{\"role\":\"system\",\"content\":\"You are an OCR engine.\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Read this.\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,${B64}\",\"detail\":\"high\"}}]}]}" \
+  http://127.0.0.1:8741/v1/chat/completions
+
+curl -N -sS -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"mac-ocr\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":\"data:image/png;base64,${B64}\"}]}]}" \
+  http://127.0.0.1:8741/v1/chat/completions
+```
+
+`scripts/openai_client_test.py` does the same calls through the official Python SDK (`pip install openai`): one image, two images, mixed text, extra parameters, and a stream. It generates its own PNGs. It does not read a photo from disk unless you pass `--image`.
+
+```bash
+pip install openai
+OCR_HTTP_TOKEN="$(cat "${HOME}/Library/Application Support/MacOcrHttp/token")" \
+  python3 scripts/openai_client_test.py
+``` A request that finds a free worker, or a free queue slot, is not rejected. Vision work runs on `OCR_HTTP_VISION_WORKERS` serial queues (default 2), not an unbounded GCD fan-out. Connection threads are capped at queue size + worker count + 16, shared across all listen addresses, so every queued request has a thread and that thread blocks on a condition instead of spinning. `GET /health` does not enter the OCR queue; the extra 16 slots keep it from waiting out a full queue.
 
 ## curl
 

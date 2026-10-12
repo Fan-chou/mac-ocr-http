@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import LineMergeCore
 
 struct HTTPRequest {
     var method: String
@@ -7,6 +8,7 @@ struct HTTPRequest {
     var query: [String: String]
     var headers: [String: String]
     var body: Data
+    var version: String
 }
 
 struct HTTPResponse {
@@ -55,7 +57,7 @@ struct HTTPResponse {
 enum HTTPReadError: Error {
     case malformed(String)
     case headersTooLarge
-    case bodyTooLarge
+    case bodyTooLarge(path: String)
     case lengthRequired
     case timeout
     case closed
@@ -67,7 +69,7 @@ enum HTTPReadError: Error {
             return HTTPResponse.json(400, ErrorBody(ok: false, error: message))
         case .headersTooLarge:
             return HTTPResponse.json(400, ErrorBody(ok: false, error: "headers too large"))
-        case .bodyTooLarge:
+        case .bodyTooLarge(_):
             return HTTPResponse.json(413, ErrorBody(ok: false, error: "request body exceeds limit"))
         case .lengthRequired:
             return HTTPResponse.json(411, ErrorBody(ok: false, error: "Content-Length required"))
@@ -110,7 +112,7 @@ enum HTTPReader {
         let length: Int
         if let contentLength = head.contentLength {
             if contentLength > maxBodyBytes {
-                throw HTTPReadError.bodyTooLarge
+                throw HTTPReadError.bodyTooLarge(path: head.path)
             }
             length = contentLength
         } else if head.method == "POST" {
@@ -135,7 +137,8 @@ enum HTTPReader {
             path: head.path,
             query: head.query,
             headers: head.headers,
-            body: body
+            body: body,
+            version: head.version
         )
     }
 }
@@ -156,6 +159,40 @@ enum HTTPWriter {
         bytes.append(response.body)
         try writeAll(fd, bytes)
     }
+
+    /// SSE after the body is already known. HTTP/1.1 uses chunked framing.
+    /// HTTP/1.0 has no chunks; the following connection close ends the body.
+    static func sendEventStream(
+        _ fd: Int32,
+        version: String,
+        events: [Data],
+        headers: [String: String]
+    ) throws {
+        let http11 = version == "HTTP/1.1"
+        var header = "\(http11 ? "HTTP/1.1" : "HTTP/1.0") 200 OK\r\n"
+        header += "Content-Type: text/event-stream; charset=utf-8\r\n"
+        header += "Cache-Control: no-cache\r\n"
+        header += "Connection: close\r\n"
+        header += "X-Content-Type-Options: nosniff\r\n"
+        if http11 {
+            header += "Transfer-Encoding: chunked\r\n"
+        }
+        for (name, value) in headers {
+            header += "\(name): \(value)\r\n"
+        }
+        header += "\r\n"
+        try writeAll(fd, Data(header.utf8))
+        if http11 {
+            for event in events {
+                try writeAll(fd, OpenAICompat.chunkFrame(event))
+            }
+            try writeAll(fd, OpenAICompat.chunkTerminator())
+        } else {
+            for event in events {
+                try writeAll(fd, event)
+            }
+        }
+    }
 }
 
 private struct ParsedHead {
@@ -164,6 +201,7 @@ private struct ParsedHead {
     var query: [String: String]
     var headers: [String: String]
     var contentLength: Int?
+    var version: String
 }
 
 private func parseHead(_ data: Data) throws -> ParsedHead {
@@ -248,7 +286,8 @@ private func parseHead(_ data: Data) throws -> ParsedHead {
         path: path,
         query: parseQuery(queryPart),
         headers: headers,
-        contentLength: contentLength
+        contentLength: contentLength,
+        version: version
     )
 }
 
@@ -307,7 +346,7 @@ private func parseQuery(_ query: String) -> [String: String] {
     return result
 }
 
-private func percentDecode(_ text: String) -> String {
+func percentDecode(_ text: String) -> String {
     var decoded = ""
     var bytes: [UInt8] = []
     var index = text.startIndex
@@ -362,6 +401,7 @@ private func isHeaderName(_ text: String) -> Bool {
 func reasonPhrase(_ status: Int) -> String {
     switch status {
     case 200: return "OK"
+    case 204: return "No Content"
     case 400: return "Bad Request"
     case 401: return "Unauthorized"
     case 404: return "Not Found"

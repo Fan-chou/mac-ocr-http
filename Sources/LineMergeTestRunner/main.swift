@@ -83,6 +83,7 @@ private func run() {
     columnReadingOrder()
     stackedParagraphCenter()
     tilePolicy()
+    openAICompatTests()
 }
 
 /// Two ~2000px fragments of one repetitive row, sharing only the 256px tile overlap.
@@ -593,4 +594,318 @@ private func timing() {
     check(elapsed < 1, "1200 lines took \(elapsed)s")
     check(page.lines.count == 1200, "timing dropped lines \(page.lines.count)")
     check(page.rows.count == 240, "timing rows \(page.rows.count)")
+}
+
+private func openAICompatTests() {
+    let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D])
+    let jpeg = Data([0xFF, 0xD8, 0xFF, 0xD9])
+    let webp = Data("RIFF".utf8) + Data([4, 0, 0, 0]) + Data("WEBP".utf8)
+    let heic = Data([0x00, 0x00, 0x00, 0x18]) + Data("ftypheic".utf8) + Data(repeating: 0, count: 8)
+    func b64(_ data: Data) -> String { data.base64EncodedString() }
+    func dataURL(_ mime: String, _ data: Data) -> String { "data:\(mime);base64,\(b64(data))" }
+
+    let system = "You are an OCR engine. Return the text only."
+    let body: [String: Any] = [
+        "model": "gpt-4o-mini",
+        "temperature": 0.7,
+        "top_p": 1,
+        "n": 3,
+        "max_tokens": 4096,
+        "max_completion_tokens": 100,
+        "stop": ["\n"],
+        "presence_penalty": 0,
+        "frequency_penalty": 0,
+        "user": "bob",
+        "response_format": ["type": "json_object"],
+        "seed": 1,
+        "logprobs": false,
+        "tools": [Any](),
+        "thinking": ["type": "disabled"],
+        "reasoning_effort": "low",
+        "unknown_field": ["kept": true],
+        "stream": false,
+        "messages": [
+            ["role": "system", "content": system],
+            ["role": "developer", "content": "ocr-language: ja-JP\nKeep the layout."],
+            [
+                "role": "user",
+                "content": [
+                    ["type": "text", "text": "Read this."],
+                    ["type": "image_url", "image_url": ["url": dataURL("image/png", png), "detail": "high"]],
+                ],
+            ],
+            ["role": "assistant", "content": "previous"],
+            [
+                "role": "user",
+                "content": [
+                    ["type": "text", "text": "second page"],
+                    ["type": "image_url", "image_url": dataURL("image/jpeg", jpeg)],
+                    ["type": "input_image", "image_url": ["url": dataURL("image/webp", webp)]],
+                ],
+            ],
+        ],
+    ]
+    let parsed = tryParse(body)
+    check(parsed.images.count == 2, "last user images \(parsed.images.count)")
+    check(parsed.images[0].data == jpeg && parsed.images[0].mediaType == "image/jpeg", "jpeg part")
+    check(parsed.images[1].data == webp && parsed.images[1].mediaType == "image/webp", "webp part")
+    check(parsed.model == "gpt-4o-mini", "model \(parsed.model ?? "")")
+    check(parsed.stream == false, "stream false")
+    check(parsed.languages == ["ja-JP"], "language hint \(parsed.languages ?? [])")
+    check(parsed.promptScalars == system.unicodeScalars.count + "ocr-language: ja-JP\nKeep the layout.".unicodeScalars.count + "Read this.".unicodeScalars.count + "previous".unicodeScalars.count + "second page".unicodeScalars.count, "prompt scalars \(parsed.promptScalars)")
+
+    let ignored = tryParse([
+        "model": 12,
+        "stream": 1,
+        "stream_options": ["include_usage": true, "include_obfuscation": false],
+        "messages": [[
+            "role": "user",
+            "content": [["type": "image_url", "image_url": ["url": "data:image/heic;base64," + wrapped(b64(heic))]]],
+        ]],
+    ])
+    check(ignored.stream == false, "numeric stream is not streaming")
+    check(ignored.includeUsage, "include_usage")
+    check(ignored.model == "12", "numeric model")
+    check(ignored.images[0].data == heic && ignored.images[0].mediaType == "image/heic", "heic")
+
+    let fallback = tryParse([
+        "messages": [
+            ["role": "user", "content": [["type": "image_url", "image_url": dataURL("image/png", png)]]],
+            ["role": "assistant", "content": [["type": "image_url", "image_url": ["url": dataURL("image/jpeg", jpeg)]]]],
+            ["role": "user", "content": "no picture here\nocr-language: en"],
+        ],
+    ])
+    check(fallback.images.count == 2, "fallback images \(fallback.images.count)")
+    check(fallback.images[0].data == png && fallback.images[1].data == jpeg, "fallback order")
+    check(fallback.languages == ["en-US"], "en hint")
+
+    let noUser = tryParse([
+        "messages": [
+            ["role": "system", "content": [["type": "image_url", "image_url": dataURL("image/png", png)]]],
+        ],
+    ])
+    check(noUser.images.count == 1 && noUser.images[0].data == png, "system fallback")
+
+    expectError(["messages": [["role": "user", "content": "text only"]]], code: "missing_image")
+    expectError(["messages": "nope"], code: nil)
+    expectError([
+        "messages": [[
+            "role": "user",
+            "content": [["type": "image_url", "image_url": ["url": "https://example.com/a.png", "detail": "auto"]]],
+        ]],
+    ], code: "invalid_image_url")
+    expectError([
+        "messages": [[
+            "role": "user",
+            "content": [["type": "image_url", "image_url": "file:///tmp/page.png"]],
+        ]],
+    ], code: "invalid_image_url")
+    expectError([
+        "messages": [[
+            "role": "user",
+            "content": [["type": "image_url", "image_url": ["url": "http://127.0.0.1/a.jpg"]]],
+        ]],
+    ], code: "invalid_image_url")
+    expectError([
+        "messages": [[
+            "role": "user",
+            "content": [["type": "image_url", "image_url": "data:image/png;base64,****"]],
+        ]],
+    ], code: "invalid_base64")
+    expectError([
+        "messages": [[
+            "role": "user",
+            "content": [["type": "image_url", "image_url": "data:text/html;base64,\(b64(Data("hi".utf8)))"]],
+        ]],
+    ], code: "invalid_image_url")
+    expectError(["messages": []], code: "missing_image")
+
+    let unknownHint = tryParse([
+        "messages": [[
+            "role": "user",
+            "content": [
+                ["type": "text", "text": "ocr-language: fr-FR"],
+                ["type": "image_url", "image_url": dataURL("image/png", png)],
+            ],
+        ]],
+    ])
+    check(unknownHint.languages == nil, "unknown hint ignored")
+
+    let responses = tryResponses([
+        "model": "custom-model",
+        "instructions": "You are an OCR engine.",
+        "temperature": 0,
+        "input": [
+            ["type": "input_text", "text": "ocr-language: zh-Hant"],
+            ["type": "input_image", "image_url": dataURL("image/png", png)],
+            ["type": "input_image", "image_url": ["url": dataURL("image/jpeg", jpeg), "detail": "low"]],
+        ],
+    ])
+    check(responses.images.count == 2, "responses images")
+    check(responses.images[0].data == png && responses.images[1].data == jpeg, "responses order")
+    check(responses.languages == ["zh-Hant"], "responses hint")
+    check(responses.model == "custom-model", "responses model")
+    expectResponsesError(["input": "Reply with OK.", "instructions": "system"], code: "missing_image")
+
+    let usage = OpenAICompat.Usage(promptScalars: 4, completion: "ab\n\ncd")
+    check(usage.completionTokens == 6 && usage.totalTokens == 10, "usage \(usage)")
+    let completion = jsonObject(OpenAICompat.chatCompletionJSON(
+        id: "chatcmpl-test",
+        created: 1711929600,
+        model: "gpt-4o-mini",
+        content: "ab\n\ncd",
+        usage: usage
+    ))
+    check(completion["object"] as? String == "chat.completion", "completion object")
+    check(completion["model"] as? String == "gpt-4o-mini", "echo model")
+    let choices = completion["choices"] as? [[String: Any]] ?? []
+    check(choices.count == 1, "n is ignored, one choice")
+    let message = choices.first?["message"] as? [String: Any]
+    check(message?["role"] as? String == "assistant", "assistant role")
+    check(message?["content"] as? String == "ab\n\ncd", "plain text despite json_object")
+    check(choices.first?["finish_reason"] as? String == "stop", "finish stop")
+    check(completion["system_fingerprint"] as? String == "fp_macocr", "fingerprint")
+
+    let events = OpenAICompat.sseEvents(
+        wire: .chat,
+        id: "chatcmpl-test",
+        created: 1711929600,
+        model: "mac-ocr",
+        content: "ab\n\ncd",
+        usage: usage,
+        includeUsage: true
+    )
+    check(String(data: events.last ?? Data(), encoding: .utf8) == "data: [DONE]\n\n", "done sentinel")
+    var pieces = ""
+    var sawRole = false
+    var sawStop = false
+    var sawUsage = false
+    for event in events.dropLast() {
+        let text = String(data: event, encoding: .utf8) ?? ""
+        check(text.hasPrefix("data: "), "chat event prefix \(text)")
+        let payload = jsonObject(Data(text.dropFirst(6).dropLast(2).utf8))
+        check(payload["object"] as? String == "chat.completion.chunk", "chunk object")
+        let chunkChoices = payload["choices"] as? [Any] ?? [""]
+        if chunkChoices.isEmpty {
+            sawUsage = payload["usage"] != nil
+            continue
+        }
+        let choice = (chunkChoices.first as? [String: Any]) ?? [:]
+        let delta = choice["delta"] as? [String: Any] ?? [:]
+        if delta["role"] as? String == "assistant" { sawRole = true }
+        if let content = delta["content"] as? String { pieces += content }
+        if choice["finish_reason"] as? String == "stop" { sawStop = true }
+    }
+    check(sawRole && sawStop && sawUsage, "sse markers role=\(sawRole) stop=\(sawStop) usage=\(sawUsage)")
+    check(pieces == "ab\n\ncd", "sse concat \(pieces)")
+
+    let framed = OpenAICompat.chunkFrame(Data("data: hi\n\n".utf8))
+    check(framed == Data("a\r\ndata: hi\n\n\r\n".utf8), "chunk frame \(framed as NSData)")
+    check(OpenAICompat.chunkTerminator() == Data("0\r\n\r\n".utf8), "chunk end")
+
+    let responseEvents = OpenAICompat.sseEvents(
+        wire: .responses,
+        id: "resp_test",
+        created: 10,
+        model: "mac-ocr",
+        content: "row",
+        usage: usage,
+        includeUsage: false
+    )
+    let deltaText = String(data: responseEvents[0], encoding: .utf8) ?? ""
+    check(deltaText.contains("event: response.output_text.delta"), "responses delta event")
+    check(deltaText.contains("\"delta\":\"row\""), "responses delta \(deltaText)")
+    let doneText = String(data: responseEvents[1], encoding: .utf8) ?? ""
+    check(doneText.contains("response.completed"), "responses completed")
+    check(doneText.contains("\"status\":\"completed\""), "responses status")
+    check(doneText.contains("\"output_text\":\"row\""), "responses output_text")
+
+    let listed = jsonObject(OpenAICompat.modelsList(id: "mac-ocr", created: 1711929600))
+    check(listed["object"] as? String == "list", "models list")
+    let data = listed["data"] as? [[String: Any]] ?? []
+    check(data.count == 1, "one model")
+    check(data.first?["id"] as? String == "mac-ocr", "model id")
+    check(data.first?["object"] as? String == "model", "model object")
+    check(data.first?["owned_by"] as? String == "mac-ocr-http", "owner")
+
+    let error = jsonObject(OpenAICompat.errorJSON(.invalid("http(s) and file URLs are not accepted", param: "image_url", code: "invalid_image_url")))
+    let err = error["error"] as? [String: Any] ?? [:]
+    check(err["message"] as? String == "http(s) and file URLs are not accepted", "error message")
+    check(err["type"] as? String == "invalid_request_error", "error type")
+    check(err["param"] as? String == "image_url", "error param")
+    check(err["code"] as? String == "invalid_image_url", "error code")
+}
+
+private func wrapped(_ url: String) -> String {
+    var lines: [String] = []
+    var rest = url[...]
+    while !rest.isEmpty {
+        let end = rest.index(rest.startIndex, offsetBy: min(16, rest.count), limitedBy: rest.endIndex) ?? rest.endIndex
+        lines.append(String(rest[..<end]))
+        rest = rest[end...]
+    }
+    return lines.joined(separator: "\n")
+}
+
+private func tryParse(_ object: [String: Any]) -> OpenAICompat.Parsed {
+    do {
+        return try OpenAICompat.parseChat(jsonData(object))
+    } catch {
+        fputs("FAIL parse chat \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+private func tryResponses(_ object: [String: Any]) -> OpenAICompat.Parsed {
+    do {
+        return try OpenAICompat.parseResponses(jsonData(object))
+    } catch {
+        fputs("FAIL parse responses \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+private func expectError(_ object: [String: Any], code: String?) {
+    do {
+        _ = try OpenAICompat.parseChat(jsonData(object))
+        fputs("FAIL expected chat error \(code ?? "any")\n", stderr)
+        exit(1)
+    } catch let error as OpenAICompat.APIError {
+        check(error.status == 400 && error.type == "invalid_request_error", "error status \(error.status) \(error.type)")
+        if let code {
+            check(error.code == code, "error code \(error.code ?? "nil") wanted \(code)")
+        }
+    } catch {
+        fputs("FAIL unexpected \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+private func expectResponsesError(_ object: [String: Any], code: String) {
+    do {
+        _ = try OpenAICompat.parseResponses(jsonData(object))
+        fputs("FAIL expected responses error\n", stderr)
+        exit(1)
+    } catch let error as OpenAICompat.APIError {
+        check(error.code == code, "responses code \(error.code ?? "nil")")
+    } catch {
+        fputs("FAIL unexpected \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+private func jsonData(_ object: Any) -> Data {
+    guard let data = try? JSONSerialization.data(withJSONObject: object) else {
+        fputs("FAIL encode\n", stderr)
+        exit(1)
+    }
+    return data
+}
+
+private func jsonObject(_ data: Data) -> [String: Any] {
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        fputs("FAIL decode \(String(data: data, encoding: .utf8) ?? "")\n", stderr)
+        exit(1)
+    }
+    return object
 }

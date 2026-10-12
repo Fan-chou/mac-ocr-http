@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import LineMergeCore
 
 enum AdmissionResult {
     case ready(Int)
@@ -123,7 +124,7 @@ final class HTTPServer: @unchecked Sendable {
             signalSources.append(source)
         }
 
-        log("mac-ocr-http starting hosts=\(config.hosts.joined(separator: ",")) port=\(config.port) workers=\(config.visionWorkers) queue=\(config.queueMax)")
+        log("mac-ocr-http starting hosts=\(config.hosts.joined(separator: ",")) port=\(config.port) workers=\(config.visionWorkers) queue=\(config.queueMax) model=\(config.openAIModel)")
         for host in config.hosts {
             if !tryListen(host, retrying: false) {
                 listenLock.lock(); pending.append(host); listenLock.unlock()
@@ -241,6 +242,19 @@ final class HTTPServer: @unchecked Sendable {
             if case .io(let message) = error {
                 fputs("io: \(message)\n", stderr)
             }
+            if case .bodyTooLarge(let path) = error, isV1(path) {
+                let response = openAIFailure(
+                    OpenAICompat.APIError.invalid(
+                        "request body exceeds limit",
+                        code: "request_too_large",
+                        status: 413
+                    ),
+                    cors: defaultV1CORS()
+                )
+                log("- \(path) 413")
+                try? HTTPWriter.send(fd, response)
+                return
+            }
             log("- - \(error.response.status)")
             try? HTTPWriter.send(fd, error.response)
             return
@@ -252,25 +266,31 @@ final class HTTPServer: @unchecked Sendable {
             return
         }
 
-        let response: HTTPResponse
-        let method: String
-        let path: String
         switch work {
-        case .http(let ready, let requestMethod, let requestPath):
-            response = ready
-            method = requestMethod
-            path = requestPath
-        case .ocr(let holder, let job, let requestMethod, let requestPath):
-            method = requestMethod
-            path = requestPath
-            response = performOCR(holder, job)
+        case .http(let response, let method, let path):
+            log("\(method) \(path) \(response.status)")
+            try? HTTPWriter.send(fd, response)
+        case .ocr(let holder, let job, let method, let path):
+            let response = performOCR(holder, job)
+            log("\(method) \(path) \(response.status)")
+            try? HTTPWriter.send(fd, response)
+        case .openai(let job):
+            switch performOpenAI(job) {
+            case .json(let response):
+                log("\(job.method) \(job.path) \(response.status)")
+                try? HTTPWriter.send(fd, response)
+            case .events(let events):
+                log("\(job.method) \(job.path) 200")
+                try? HTTPWriter.sendEventStream(fd, version: job.version, events: events, headers: job.cors)
+            }
         }
-        log("\(method) \(path) \(response.status)")
-        try? HTTPWriter.send(fd, response)
     }
 
     /// `request` dies with this function, so the raw body is released before Vision runs.
     private func classify(_ request: HTTPRequest) -> RequestWork {
+        if isV1(request.path) {
+            return classifyV1(request)
+        }
         switch (request.method, request.path) {
         case ("GET", "/health"):
             return .http(HTTPResponse.health(), request.method, request.path)
@@ -410,11 +430,303 @@ final class HTTPServer: @unchecked Sendable {
             }
         }
     }
+
+    private func classifyV1(_ request: HTTPRequest) -> RequestWork {
+        if request.method == "OPTIONS" {
+            return .http(v1Preflight(request), request.method, request.path)
+        }
+        let cors = v1CORS(request)
+        guard auth.allows(request.headers) else {
+            return .http(openAIUnauthorized(cors), request.method, request.path)
+        }
+        if request.method == "GET", request.path == "/v1/models" {
+            let created = Int(Date().timeIntervalSince1970)
+            return .http(
+                v1JSON(200, OpenAICompat.modelsList(id: config.openAIModel, created: created), cors: cors),
+                request.method,
+                request.path
+            )
+        }
+        if request.method == "GET", request.path.hasPrefix("/v1/models/") {
+            let raw = String(request.path.dropFirst("/v1/models/".count))
+            let id = percentDecode(raw)
+            if id == config.openAIModel {
+                let created = Int(Date().timeIntervalSince1970)
+                return .http(
+                    v1JSON(200, OpenAICompat.modelJSON(id: id, created: created), cors: cors),
+                    request.method,
+                    request.path
+                )
+            }
+            return .http(
+                openAIFailure(
+                    .invalid("The model '\(id)' does not exist", param: "model", code: "model_not_found", status: 404),
+                    cors: cors
+                ),
+                request.method,
+                request.path
+            )
+        }
+        if request.path == "/v1/models" || request.path.hasPrefix("/v1/models/") {
+            return .http(
+                openAIFailure(.invalid("method not allowed", code: "method_not_allowed", status: 405), cors: cors, extra: ["Allow": "GET, OPTIONS"]),
+                request.method,
+                request.path
+            )
+        }
+        if request.method == "POST",
+           (request.path == "/v1/chat/completions" || request.path == "/v1/responses") {
+            do {
+                let parsed = try request.path.hasSuffix("/responses")
+                    ? OpenAICompat.parseResponses(request.body)
+                    : OpenAICompat.parseChat(request.body)
+                let model = parsed.model ?? config.openAIModel
+                return .openai(OpenAIJob(
+                    method: request.method,
+                    path: request.path,
+                    version: request.version,
+                    images: parsed.images.map(\.data),
+                    stream: parsed.stream,
+                    includeUsage: parsed.includeUsage,
+                    model: model,
+                    languages: parsed.languages,
+                    promptScalars: parsed.promptScalars,
+                    wire: parsed.wire,
+                    cors: cors
+                ))
+            } catch let error as OpenAICompat.APIError {
+                return .http(openAIFailure(error, cors: cors), request.method, request.path)
+            } catch {
+                return .http(
+                    openAIFailure(.invalid("bad request", code: "invalid_json"), cors: cors),
+                    request.method,
+                    request.path
+                )
+            }
+        }
+        if request.path == "/v1/chat/completions" || request.path == "/v1/responses" {
+            return .http(
+                openAIFailure(.invalid("method not allowed", code: "method_not_allowed", status: 405), cors: cors, extra: ["Allow": "POST, OPTIONS"]),
+                request.method,
+                request.path
+            )
+        }
+        return .http(
+            openAIFailure(.invalid("not found", code: "not_found", status: 404), cors: cors),
+            request.method,
+            request.path
+        )
+    }
+
+    private func performOpenAI(_ job: OpenAIJob) -> OpenAIOutcome {
+        switch admission.acquire() {
+        case .full:
+            return .json(openAIFailure(
+                OpenAICompat.APIError(status: 503, message: "queue full", type: "server_error", param: nil, code: "queue_full"),
+                cors: job.cors,
+                extra: ["Retry-After": "1"]
+            ))
+        case .timedOut:
+            return .json(openAIFailure(
+                OpenAICompat.APIError(status: 503, message: "queue wait timed out", type: "server_error", param: nil, code: "queue_timeout"),
+                cors: job.cors,
+                extra: ["Retry-After": "1"]
+            ))
+        case .ready(let index):
+            defer { admission.release(index) }
+            let ocrJob = OCRJob(
+                level: .accurate,
+                languages: job.languages,
+                scale: .auto,
+                maxPixel: nil,
+                force: nil,
+                tileMinGlyphFrac: nil,
+                script: nil,
+                layout: .rows
+            )
+            var images = job.images
+            var texts: [String] = []
+            texts.reserveCapacity(images.count)
+            for offset in images.indices {
+                let holder = DataHolder(images[offset])
+                images[offset] = Data()
+                do {
+                    let payload = try vision.recognize(
+                        on: index,
+                        holder: holder,
+                        job: ocrJob,
+                        maxPixels: config.maxPixels,
+                        maxPixel: config.maxPixel,
+                        minGlyphFrac: config.tileMinGlyphFrac
+                    )
+                    texts.append(payload.text)
+                } catch {
+                    return .json(openAIFailure(openAIMap(error), cors: job.cors))
+                }
+            }
+            let content = texts.joined(separator: "\n\n")
+            let created = Int(Date().timeIntervalSince1970)
+            let usage = OpenAICompat.Usage(promptScalars: job.promptScalars, completion: content)
+            let id = OpenAICompat.completionID(prefix: job.wire == .chat ? "chatcmpl-" : "resp_")
+            if job.stream {
+                let events = OpenAICompat.sseEvents(
+                    wire: job.wire,
+                    id: id,
+                    created: created,
+                    model: job.model,
+                    content: content,
+                    usage: usage,
+                    includeUsage: job.includeUsage
+                )
+                return .events(events)
+            }
+            let body: Data
+            switch job.wire {
+            case .chat:
+                body = OpenAICompat.chatCompletionJSON(id: id, created: created, model: job.model, content: content, usage: usage)
+            case .responses:
+                body = OpenAICompat.responsesJSON(id: id, created: created, model: job.model, content: content, usage: usage)
+            }
+            return .json(v1JSON(200, body, cors: job.cors))
+        }
+    }
 }
 
 private enum RequestWork {
     case http(HTTPResponse, String, String)
     case ocr(DataHolder, OCRJob, String, String)
+    case openai(OpenAIJob)
+}
+
+private enum OpenAIOutcome {
+    case json(HTTPResponse)
+    case events([Data])
+}
+
+private struct OpenAIJob {
+    var method: String
+    var path: String
+    var version: String
+    var images: [Data]
+    var stream: Bool
+    var includeUsage: Bool
+    var model: String
+    var languages: [String]?
+    var promptScalars: Int
+    var wire: OpenAICompat.Wire
+    var cors: [String: String]
+}
+
+private func isV1(_ path: String) -> Bool {
+    path == "/v1" || path.hasPrefix("/v1/")
+}
+
+private func defaultV1CORS() -> [String: String] {
+    [
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept",
+        "Access-Control-Max-Age": "600",
+    ]
+}
+
+private func v1CORS(_ request: HTTPRequest) -> [String: String] {
+    var headers = defaultV1CORS()
+    if let requested = request.headers["access-control-request-headers"] {
+        let names = requested.split(separator: ",").map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let safe = names.filter { name in
+            !name.isEmpty && name.count <= 64 && name.unicodeScalars.allSatisfy { scalar in
+                let value = scalar.value
+                return (0x30...0x39).contains(value)
+                    || (0x41...0x5A).contains(value)
+                    || (0x61...0x7A).contains(value)
+                    || value == 0x2D
+            }
+        }
+        if !safe.isEmpty {
+            var seen = Set(headers["Access-Control-Allow-Headers", default: ""].split(separator: ",").map {
+                $0.trimmingCharacters(in: .whitespaces).lowercased()
+            })
+            var allow = headers["Access-Control-Allow-Headers"] ?? ""
+            for name in safe where seen.insert(name.lowercased()).inserted {
+                allow += ", \(name)"
+            }
+            headers["Access-Control-Allow-Headers"] = allow
+        }
+    }
+    return headers
+}
+
+private func v1JSON(_ status: Int, _ body: Data, cors: [String: String]) -> HTTPResponse {
+    HTTPResponse(status: status, reason: reasonPhrase(status), headers: cors, body: body)
+}
+
+private func openAIFailure(
+    _ error: OpenAICompat.APIError,
+    cors: [String: String],
+    extra: [String: String] = [:]
+) -> HTTPResponse {
+    var headers = cors
+    for (name, value) in extra {
+        headers[name] = value
+    }
+    return HTTPResponse(
+        status: error.status,
+        reason: reasonPhrase(error.status),
+        headers: headers,
+        body: OpenAICompat.errorJSON(error)
+    )
+}
+
+private func openAIUnauthorized(_ cors: [String: String]) -> HTTPResponse {
+    openAIFailure(
+        .invalid("invalid API key", param: nil, code: "invalid_api_key", status: 401),
+        cors: cors,
+        extra: ["WWW-Authenticate": "Bearer"]
+    )
+}
+
+private func v1Preflight(_ request: HTTPRequest) -> HTTPResponse {
+    HTTPResponse(status: 204, reason: "No Content", headers: v1CORS(request), body: Data())
+}
+
+private func openAIMap(_ error: Error) -> OpenAICompat.APIError {
+    if let error = error as? ImageDecodeError {
+        switch error {
+        case .tooLarge(let width, let height, let maxPixels):
+            return .invalid(
+                "image too large (\(width)x\(height), max \(maxPixels) pixels)",
+                code: "image_too_large",
+                status: 413
+            )
+        case .unrecognized:
+            return .invalid("unrecognized image data", code: "invalid_image")
+        }
+    }
+    if let error = error as? OCREngineError {
+        switch error {
+        case .badRequest(let message):
+            return .invalid(message, code: "invalid_request")
+        case .vision(let message):
+            let trimmed = message.count > 180 ? String(message.prefix(180)) : message
+            return OpenAICompat.APIError(
+                status: 500,
+                message: "vision recognition failed: \(trimmed)",
+                type: "server_error",
+                param: nil,
+                code: "recognition_failed"
+            )
+        }
+    }
+    return OpenAICompat.APIError(
+        status: 500,
+        message: "internal error",
+        type: "server_error",
+        param: nil,
+        code: "internal_error"
+    )
 }
 
 private func busy(_ message: String) -> HTTPResponse {
