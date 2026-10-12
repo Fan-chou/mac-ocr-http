@@ -1026,6 +1026,7 @@ private func parseJSONOCR(_ body: Data, query: [String: String]) throws -> (data
         scaleText = query["scale"]
     }
     let forceText = try optionalString(dict["force"], name: "force", allowed: "whole or tile") ?? query["force"]
+    let fragmentsText = try optionalString(dict["fragments"], name: "fragments", allowed: "drop or keep") ?? query["fragments"]
     let fracText = try fracString(dict["tileMinGlyphFrac"])
         ?? query["tileminglyphfrac"]
         ?? fracString(dict["tileMinTextFrac"])
@@ -1044,7 +1045,8 @@ private func parseJSONOCR(_ body: Data, query: [String: String]) throws -> (data
         scriptText: scriptText,
         layoutText: layoutText,
         forceText: forceText,
-        fracText: fracText
+        fracText: fracText,
+        fragmentsText: fragmentsText
     )
     return (data, job)
 }
@@ -1058,7 +1060,8 @@ private func jobFromQuery(_ query: [String: String]) throws -> OCRJob {
         scriptText: query["script"],
         layoutText: query["layout"],
         forceText: query["force"],
-        fracText: query["tileminglyphfrac"] ?? query["tilemintextfrac"]
+        fracText: query["tileminglyphfrac"] ?? query["tilemintextfrac"],
+        fragmentsText: query["fragments"]
     )
 }
 
@@ -1070,7 +1073,8 @@ private func makeJob(
     scriptText: String?,
     layoutText: String?,
     forceText: String?,
-    fracText: String?
+    fracText: String?,
+    fragmentsText: String? = nil
 ) throws -> OCRJob {
     let scale = try parseScale(scaleText)
     let force = try parseForce(forceText)
@@ -1085,7 +1089,8 @@ private func makeJob(
         force: force,
         tileMinGlyphFrac: try parseRequestFrac(fracText),
         script: try parseScript(scriptText),
-        layout: try parseLayout(layoutText)
+        layout: try parseLayout(layoutText),
+        fragments: try parseFragments(fragmentsText)
     )
 }
 
@@ -1137,6 +1142,19 @@ private func parseScale(_ raw: String?) throws -> ScaleMode {
         return .downscale
     default:
         throw BadRequest(message: "scale must be auto, none, tile, or downscale")
+    }
+}
+
+private func parseFragments(_ raw: String?) throws -> Bool {
+    let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !trimmed.isEmpty else { return true }
+    switch trimmed.lowercased() {
+    case "drop":
+        return true
+    case "keep":
+        return false
+    default:
+        throw BadRequest(message: "fragments must be drop or keep")
     }
 }
 

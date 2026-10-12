@@ -94,7 +94,8 @@ final class VisionPool: @unchecked Sendable {
             script: script,
             started: started,
             minGlyphFrac: job.tileMinGlyphFrac ?? minGlyphFrac,
-            force: job.force
+            force: job.force,
+            fragments: job.fragments
         )
     }
 }

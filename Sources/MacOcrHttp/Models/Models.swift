@@ -44,6 +44,8 @@ struct OCRJob: Sendable {
     /// nil means: `hans` when `zh-Hans` is first and `zh-Hant` was not requested, otherwise `auto`.
     var script: ScriptMode?
     var layout: LayoutMode
+    /// Drop low-confidence icon, edge-cut and corner fragments (`fragments=drop`, the default).
+    var fragments: Bool = true
 }
 
 let defaultRecognitionLanguages = ["zh-Hans", "en-US"]

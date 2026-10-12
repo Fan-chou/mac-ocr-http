@@ -64,7 +64,8 @@ enum OCREngine {
     static func lines(
         image: CGImage,
         languages: [String],
-        level: RecognitionLevel
+        level: RecognitionLevel,
+        filterFragments: Bool = false
     ) throws -> (lines: [OCRLine], echo: RecognitionEcho) {
         let width = image.width
         let height = image.height
@@ -94,6 +95,7 @@ enum OCREngine {
 
         let observations = request.results ?? []
         var lines: [OCRLine] = []
+        var fragmentLines: [FragmentLine] = []
         lines.reserveCapacity(observations.count)
         for observation in observations {
             guard let candidate = observation.topCandidates(1).first else { continue }
@@ -131,7 +133,59 @@ enum OCREngine {
                 ),
                 quad: quad
             ))
+            if filterFragments {
+                fragmentLines.append(fragmentLine(candidate, line: lines[lines.count - 1], width: width, height: height))
+            }
+        }
+        if filterFragments {
+            lines = applyFragmentFilter(lines, fragmentLines, width: width, height: height)
         }
         return (lines, echo)
+    }
+
+    /// Per-character boxes are only requested for low-confidence lines; the
+    /// filter leaves every other line alone.
+    private static func fragmentLine(_ candidate: VNRecognizedText, line: OCRLine, width: Int, height: Int) -> FragmentLine {
+        var glyphs: [FragmentGlyph] = []
+        if line.confidence < FragmentFilter.lowConfidence {
+            let text = candidate.string
+            var index = text.startIndex
+            while index < text.endIndex {
+                let next = text.index(after: index)
+                var box: BBox?
+                if let rect = try? candidate.boundingBox(for: index..<next)?.boundingBox, rect.width > 0, rect.height > 0 {
+                    box = Geometry.pixelBBox(normalizedBottomLeft: rect, width: width, height: height)
+                }
+                glyphs.append(FragmentGlyph(text: String(text[index..<next]), box: box))
+                index = next
+            }
+        }
+        return FragmentLine(text: line.text, confidence: line.confidence, bbox: line.bbox, glyphs: glyphs)
+    }
+
+    private static func applyFragmentFilter(_ lines: [OCRLine], _ fragments: [FragmentLine], width: Int, height: Int) -> [OCRLine] {
+        let actions = FragmentFilter.decide(lines: fragments, imageWidth: Double(width), imageHeight: Double(height))
+        var kept: [OCRLine] = []
+        kept.reserveCapacity(lines.count)
+        for (line, action) in zip(lines, actions) {
+            switch action {
+            case .keep:
+                kept.append(line)
+            case .drop:
+                continue
+            case .trimLeading(let count, let newLeft, _):
+                var trimmed = line
+                trimmed.text = FragmentFilter.trimmed(line.text, count: count)
+                guard !trimmed.text.isEmpty else { continue }
+                let right = line.bbox.x + line.bbox.width
+                let left = min(max(newLeft, line.bbox.x), right)
+                trimmed.bbox.x = round2(left)
+                trimmed.bbox.width = round2(right - left)
+                trimmed.quad.topLeft.x = max(trimmed.quad.topLeft.x, left)
+                trimmed.quad.bottomLeft.x = max(trimmed.quad.bottomLeft.x, left)
+                kept.append(trimmed)
+            }
+        }
+        return kept
     }
 }

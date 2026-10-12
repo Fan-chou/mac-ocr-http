@@ -85,6 +85,7 @@ private func run() {
     tilePolicy()
     openAICompatTests()
     debugCaptureTests()
+    fragmentFilterTests()
 }
 
 /// Two ~2000px fragments of one repetitive row, sharing only the 256px tile overlap.
@@ -1175,4 +1176,72 @@ private func jsonObject(_ data: Data) -> [String: Any] {
         exit(1)
     }
     return object
+}
+
+/// Glyph boxes laid left to right; `widths` per character (0 = no box, e.g. a space).
+private func fragLine(_ text: String, conf: Double, x: Double, y: Double, h: Double, widths: [Double]) -> FragmentLine {
+    var glyphs: [FragmentGlyph] = []
+    var cursor = x
+    for (character, width) in zip(text, widths) {
+        if width > 0 {
+            glyphs.append(FragmentGlyph(text: String(character), box: BBox(x: cursor, y: y, width: width, height: h)))
+            cursor += width
+        } else {
+            glyphs.append(FragmentGlyph(text: String(character), box: nil))
+        }
+    }
+    return FragmentLine(text: text, confidence: conf, bbox: BBox(x: x, y: y, width: cursor - x, height: h), glyphs: glyphs)
+}
+
+private func fragmentFilterTests() {
+    func one(_ line: FragmentLine, _ w: Double = 300, _ h: Double = 80) -> FragmentAction {
+        FragmentFilter.decide(lines: [line], imageWidth: w, imageHeight: h)[0]
+    }
+    // Wide CJK-looking icon glued to a label.
+    let icon = one(fragLine("口下载文件", conf: 0.3, x: 30, y: 20, h: 18, widths: [27, 17, 16, 17, 16]))
+    if case .trimLeading(let count, let left, _) = icon {
+        check(count == 1 && left == 57, "icon trim \(count) \(left)")
+        check(FragmentFilter.trimmed("口下载文件", count: count) == "下载文件", "icon text")
+    } else { check(false, "icon \(icon)") }
+    // Latin icon followed by a space.
+    let spaced = one(fragLine("Q 搜索记录", conf: 0.3, x: 20, y: 20, h: 20, widths: [27, 0, 21, 20, 18, 19]))
+    if case .trimLeading(let count, _, _) = spaced {
+        check(FragmentFilter.trimmed("Q 搜索记录", count: count) == "搜索记录", "spaced icon text")
+    } else { check(false, "spaced icon \(spaced)") }
+    // Glyph cut by the left crop edge.
+    let cut = one(fragLine("测试数据已经同步完成", conf: 0.3, x: 3, y: 10, h: 18, widths: [11, 17, 16, 18, 16, 17, 18, 16, 17, 18]))
+    if case .trimLeading(let count, let left, _) = cut {
+        check(count == 1 && left == 14, "cut trim \(count) \(left)")
+    } else { check(false, "cut \(cut)") }
+    // Corner watermark next to large confident text.
+    let page = [
+        fragLine("标题文字", conf: 1.0, x: 10, y: 2, h: 76, widths: [70, 70, 70, 70]),
+        fragLine("水印X", conf: 0.3, x: 278, y: 69, h: 12, widths: [11, 12, 9]),
+    ]
+    let corner = FragmentFilter.decide(lines: page, imageWidth: 300, imageHeight: 83)
+    check(corner[0] == .keep, "big text kept")
+    if case .drop = corner[1] {} else { check(false, "corner speck \(corner[1])") }
+    // Isolated one-glyph observation left of a label on the same row.
+    let row = FragmentFilter.decide(lines: [
+        fragLine("田", conf: 0.3, x: 10, y: 20, h: 18, widths: [18]),
+        fragLine("打开设置", conf: 0.5, x: 40, y: 20, h: 18, widths: [17, 17, 17, 17]),
+    ], imageWidth: 200, imageHeight: 60)
+    if case .drop = row[0] {} else { check(false, "isolated icon \(row[0])") }
+    check(row[1] == .keep, "label kept")
+
+    // Conservative cases: nothing changes.
+    check(one(fragLine("口下载文件", conf: 0.5, x: 30, y: 20, h: 18, widths: [27, 17, 16, 17, 16])) == .keep, "medium confidence untouched")
+    check(one(fragLine("测试数据已经同步完成", conf: 1.0, x: 0, y: 10, h: 18, widths: [9, 17, 16, 18, 16, 17, 18, 16, 17, 18])) == .keep, "confident edge line untouched")
+    check(one(fragLine("测试数据已经同步完成", conf: 0.3, x: 3, y: 10, h: 18, widths: [17, 17, 16, 18, 16, 17, 18, 16, 17, 18])) == .keep, "full-width edge glyph kept")
+    check(one(fragLine("测试数据已经同步完成", conf: 0.3, x: 30, y: 10, h: 18, widths: [11, 17, 16, 18, 16, 17, 18, 16, 17, 18])) == .keep, "narrow glyph off the edge kept")
+    check(one(fragLine("下载文件", conf: 0.3, x: 30, y: 20, h: 18, widths: [17, 17, 16, 17])) == .keep, "plain low-confidence label kept")
+    check(one(fragLine("Q search", conf: 0.3, x: 20, y: 20, h: 20, widths: [27, 0, 12, 11, 11, 11, 8, 11])) == .keep, "latin text after a letter kept")
+    check(one(fragLine("OK", conf: 0.3, x: 0, y: 0, h: 20, widths: [12, 12])) == .keep, "lone short line kept without larger text")
+    let midSmall = FragmentFilter.decide(lines: [
+        fragLine("标题文字", conf: 1.0, x: 10, y: 2, h: 40, widths: [36, 36, 36, 36]),
+        fragLine("注释", conf: 0.3, x: 100, y: 50, h: 14, widths: [13, 13]),
+    ], imageWidth: 300, imageHeight: 120)
+    check(midSmall[1] == .keep, "small caption away from the edges kept \(midSmall[1])")
+    let alone = FragmentFilter.decide(lines: [fragLine("田", conf: 0.3, x: 10, y: 20, h: 18, widths: [18])], imageWidth: 100, imageHeight: 60)
+    check(alone[0] == .keep, "single glyph with no neighbour kept")
 }

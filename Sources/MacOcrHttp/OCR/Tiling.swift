@@ -61,7 +61,8 @@ enum ImageOCR {
         script: ScriptMode,
         started: Date,
         minGlyphFrac: Double,
-        force: TileForce?
+        force: TileForce?,
+        fragments: Bool = true
     ) throws -> OCRPayload {
         let bitmapWidth = decoded.image.width
         let bitmapHeight = decoded.image.height
@@ -76,6 +77,7 @@ enum ImageOCR {
                 started: started,
                 minGlyphFrac: minGlyphFrac,
                 force: force,
+                fragments: fragments,
                 scaleX: scaleX,
                 scaleY: scaleY
             )
@@ -91,7 +93,8 @@ enum ImageOCR {
             level: level,
             image: decoded.image,
             scaleX: scaleX,
-            scaleY: scaleY
+            scaleY: scaleY,
+            fragments: fragments
         )
         let measured = TilePolicy.measure(
             width: decoded.originalWidth,
@@ -129,6 +132,7 @@ enum ImageOCR {
         started: Date,
         minGlyphFrac: Double,
         force: TileForce?,
+        fragments: Bool,
         scaleX: Double,
         scaleY: Double
     ) throws -> OCRPayload {
@@ -144,7 +148,8 @@ enum ImageOCR {
                 level: level,
                 image: decoded.image,
                 scaleX: scaleX,
-                scaleY: scaleY
+                scaleY: scaleY,
+                fragments: fragments
             )
             let choice = TilePolicy.decide(
                 width: decoded.originalWidth,
@@ -178,7 +183,8 @@ enum ImageOCR {
                 level: level,
                 image: probeImage,
                 scaleX: probeScaleX,
-                scaleY: probeScaleY
+                scaleY: probeScaleY,
+                fragments: fragments
             )
         }
         let choice = TilePolicy.decide(
@@ -210,7 +216,8 @@ enum ImageOCR {
             level: level,
             image: decoded.image,
             scaleX: scaleX,
-            scaleY: scaleY
+            scaleY: scaleY,
+            fragments: fragments
         )
         return payload(
             decoded: decoded,
@@ -254,7 +261,8 @@ enum ImageOCR {
         level: RecognitionLevel,
         image source: CGImage,
         scaleX: Double,
-        scaleY: Double
+        scaleY: Double,
+        fragments: Bool
     ) throws -> Pass {
         var collected: [OCRLine] = []
         var tileFrames: [TileFrame?] = []
@@ -282,7 +290,9 @@ enum ImageOCR {
                     originX = rect.x
                     originY = rect.y
                 }
-                let pass = try OCREngine.lines(image: image, languages: languages, level: level)
+                // Only a pass over the whole bitmap has real image edges.
+                let whole = rect.x == 0 && rect.y == 0 && rect.width == bitmapWidth && rect.height == bitmapHeight
+                let pass = try OCREngine.lines(image: image, languages: languages, level: level, filterFragments: fragments && whole)
                 echo = pass.echo
                 return pass.lines.map {
                     mapLine($0, originX: Double(originX), originY: Double(originY), scaleX: scaleX, scaleY: scaleY)
