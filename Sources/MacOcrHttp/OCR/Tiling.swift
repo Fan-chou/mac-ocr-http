@@ -29,6 +29,22 @@ enum TilePlan {
         return result
     }
 
+    /// Adaptive grid from the probe's glyph height (bitmap pixels).
+    static func rects(width: Int, height: Int, glyphPx: Double) -> [Rect] {
+        let plan = AdaptiveTile.plan(glyphPx: glyphPx)
+        let keep = AdaptiveTile.wholeAxisLimit(tile: plan.length)
+        let xs = AdaptiveTile.spans(length: width, tile: plan.length, overlap: plan.overlap, keepWholeUpTo: keep)
+        let ys = AdaptiveTile.spans(length: height, tile: plan.length, overlap: plan.overlap, keepWholeUpTo: keep)
+        var result: [Rect] = []
+        result.reserveCapacity(xs.count * ys.count)
+        for y in ys {
+            for x in xs {
+                result.append(Rect(x: x.offset, y: y.offset, width: x.length, height: y.length))
+            }
+        }
+        return result
+    }
+
     static func spans(length: Int) -> [(offset: Int, length: Int)] {
         if length <= tileLength {
             return [(0, max(length, 0))]
@@ -117,7 +133,9 @@ enum ImageOCR {
             frames: pass.frames,
             echo: pass.echo,
             tiles: rects.count,
-            choice: choice
+            choice: choice,
+            languages: languages,
+            level: level
         )
     }
 
@@ -167,7 +185,9 @@ enum ImageOCR {
                 frames: pass.frames,
                 echo: pass.echo,
                 tiles: rects.count,
-                choice: choice
+                choice: choice,
+                languages: languages,
+                level: level
             )
         }
         let probe = try autoreleasepool { () -> Pass in
@@ -204,10 +224,14 @@ enum ImageOCR {
                 frames: probe.frames,
                 echo: probe.echo,
                 tiles: 1,
-                choice: choice
+                choice: choice,
+                languages: languages,
+                level: level
             )
         }
-        let rects = TilePlan.rects(width: bitmapWidth, height: bitmapHeight)
+        // choice.glyphPx is in original pixels; the grid is cut from the bitmap.
+        let bitmapGlyph = choice.glyphPx / max(scaleY, 1e-9)
+        let rects = TilePlan.rects(width: bitmapWidth, height: bitmapHeight, glyphPx: bitmapGlyph)
         let tiled = try collect(
             rects: rects,
             bitmapWidth: bitmapWidth,
@@ -228,7 +252,9 @@ enum ImageOCR {
             frames: tiled.frames,
             echo: tiled.echo,
             tiles: rects.count,
-            choice: choice
+            choice: choice,
+            languages: languages,
+            level: level
         )
     }
 
@@ -306,6 +332,48 @@ enum ImageOCR {
         return Pass(lines: collected, frames: tileFrames, echo: echo)
     }
 
+    /// Upright beats flipped: a 180°-turned reading that an upright line
+    /// covers is dropped. A flipped line with no upright counterpart is read
+    /// again from a padded crop of the bitmap; it is dropped if that crop still
+    /// gives nothing upright. At most `maxRereads` crops per request.
+    static let maxRereads = 64
+
+    private static func resolveFlipped(
+        lines: [OCRLine],
+        frames: [TileFrame?],
+        image: CGImage,
+        scaleX: Double,
+        scaleY: Double,
+        languages: [String],
+        level: RecognitionLevel
+    ) -> (lines: [OCRLine], frames: [TileFrame?]) {
+        let resolved = Orientation.resolve(lines)
+        if resolved.orphans.isEmpty && resolved.kept.count == lines.count {
+            return (lines, frames)
+        }
+        let tagged = frames.count == lines.count
+        var outLines = resolved.kept.map { lines[$0] }
+        var outFrames: [TileFrame?] = resolved.kept.map { tagged ? frames[$0] : nil }
+        for (number, index) in resolved.orphans.enumerated() where number < maxRereads {
+            let box = lines[index].bbox
+            let pad = max(8.0, box.height * 0.6)
+            let x0 = max(0, Int(((box.x - pad) / scaleX).rounded(.down)))
+            let y0 = max(0, Int(((box.y - pad) / scaleY).rounded(.down)))
+            let x1 = min(image.width, Int(((box.x + box.width + pad) / scaleX).rounded(.up)))
+            let y1 = min(image.height, Int(((box.y + box.height + pad) / scaleY).rounded(.up)))
+            guard x1 - x0 >= 4, y1 - y0 >= 4,
+                  let crop = cropBitmap(image, x: x0, y: y0, width: x1 - x0, height: y1 - y0) else { continue }
+            let reread = (try? autoreleasepool { () -> [OCRLine] in
+                try OCREngine.lines(image: crop, languages: languages, level: level, filterFragments: false).lines
+            }) ?? []
+            for line in reread where !Orientation.isFlipped(line.quad) {
+                outLines.append(mapLine(line, originX: Double(x0), originY: Double(y0), scaleX: scaleX, scaleY: scaleY))
+                outFrames.append(tagged ? frames[index] : nil)
+            }
+        }
+        return (outLines, outFrames)
+    }
+
     private static func payload(
         decoded: DecodedImage,
         scale: ScaleMode,
@@ -315,8 +383,18 @@ enum ImageOCR {
         frames: [TileFrame?],
         echo: RecognitionEcho,
         tiles: Int,
-        choice: TileChoice
+        choice: TileChoice,
+        languages: [String],
+        level: RecognitionLevel
     ) -> OCRPayload {
+        let scaleX = Double(decoded.originalWidth) / Double(max(decoded.image.width, 1))
+        let scaleY = Double(decoded.originalHeight) / Double(max(decoded.image.height, 1))
+        let upright = resolveFlipped(
+            lines: lines, frames: frames, image: decoded.image,
+            scaleX: scaleX, scaleY: scaleY, languages: languages, level: level
+        )
+        let lines = upright.lines
+        let frames = upright.frames
         // One tile has no seam to stitch. Skip dedupe and only group rows and columns.
         let page = tiles == 1
             ? LineMerge.group(lines)

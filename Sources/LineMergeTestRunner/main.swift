@@ -86,6 +86,9 @@ private func run() {
     openAICompatTests()
     debugCaptureTests()
     fragmentFilterTests()
+    adaptiveTileTests()
+    orientationTests()
+    tableTests()
 }
 
 /// Two ~2000px fragments of one repetitive row, sharing only the 256px tile overlap.
@@ -1244,4 +1247,116 @@ private func fragmentFilterTests() {
     check(midSmall[1] == .keep, "small caption away from the edges kept \(midSmall[1])")
     let alone = FragmentFilter.decide(lines: [fragLine("田", conf: 0.3, x: 10, y: 20, h: 18, widths: [18])], imageWidth: 100, imageHeight: 60)
     check(alone[0] == .keep, "single glyph with no neighbour kept")
+}
+
+
+// MARK: - Adaptive tiles, flipped quads, grid tables (synthetic only)
+
+private func adaptiveTileTests() {
+    let small = AdaptiveTile.plan(glyphPx: 15)
+    check(small.length == 1364 && small.overlap == 256, "15px plan \(small)")
+    let big = AdaptiveTile.plan(glyphPx: 32)
+    check(big.length == 2048 && big.overlap == 256, "32px keeps classic grid \(big)")
+    let photo = AdaptiveTile.plan(glyphPx: 46.6)
+    check(photo.length == 2048 && photo.overlap == 256, "46.6px keeps classic grid \(photo)")
+    let tiny = AdaptiveTile.plan(glyphPx: 6)
+    check(tiny.length == 1024, "floor 1024 \(tiny)")
+    let huge = AdaptiveTile.plan(glyphPx: 493)
+    check(huge.length == 2048 && huge.overlap == 256, "full tiles keep 256 overlap \(huge)")
+    // A shrunken tile overlaps by three line heights once that passes 256.
+    check(AdaptiveTile.plan(glyphPx: 12).overlap >= Int(3 * 1.5 * 12), "shrunken overlap covers 3 lines")
+    let none = AdaptiveTile.plan(glyphPx: 0)
+    check(none.length == 2048 && none.overlap == 256, "unknown glyph \(none)")
+    // A 1700x2300 page of 15px text: full-width columns, two rows of tiles.
+    let keep = AdaptiveTile.wholeAxisLimit(tile: small.length)
+    let xs = AdaptiveTile.spans(length: 1700, tile: small.length, overlap: small.overlap, keepWholeUpTo: keep)
+    let ys = AdaptiveTile.spans(length: 2300, tile: small.length, overlap: small.overlap, keepWholeUpTo: keep)
+    check(xs.count == 1 && xs[0].length == 1700, "width kept whole \(xs)")
+    check(ys.count == 2 && ys[0].offset == 0 && ys[1].offset + ys[1].length == 2300, "two row tiles \(ys)")
+    check(ys[0].length - ys[1].offset >= small.overlap, "row tiles overlap \(ys)")
+    // The classic grid is unchanged for 2048 tiles.
+    let classic = AdaptiveTile.spans(length: 3508, tile: 2048, overlap: 256, keepWholeUpTo: 2048)
+    check(classic.map(\.offset) == [0, 1460], "classic spans \(classic)")
+}
+
+private func flippedLine(_ text: String, _ x: Double, _ y: Double, _ w: Double, _ h: Double, _ c: Double) -> OCRLine {
+    OCRLine(
+        text: text,
+        confidence: c,
+        bbox: BBox(x: x, y: y, width: w, height: h),
+        quad: Quad(
+            topLeft: Point(x: x + w, y: y + h),
+            topRight: Point(x: x, y: y + h),
+            bottomRight: Point(x: x, y: y),
+            bottomLeft: Point(x: x + w, y: y)
+        )
+    )
+}
+
+private func orientationTests() {
+    check(!Orientation.isFlipped(line("37", 0, 0, 40, 30, 1).quad), "upright quad")
+    check(Orientation.isFlipped(flippedLine("LE", 0, 0, 40, 30, 1).quad), "flipped quad")
+    // Upright beats flipped even when the flipped reading is more confident.
+    var lines = [
+        line("header", 0, 0, 200, 30, 1),
+        line("607", 10, 50, 40, 30, 0.5),
+        flippedLine("LOL", 12, 52, 40, 30, 1.0),
+        flippedLine("0Z9", 10, 120, 40, 30, 0.3),
+        line("row three", 0, 200, 200, 30, 1),
+        line("row four", 0, 260, 200, 30, 1),
+        line("row five", 0, 320, 200, 30, 1),
+        line("row six", 0, 380, 200, 30, 1),
+    ]
+    var resolved = Orientation.resolve(lines)
+    check(resolved.kept == [0, 1, 4, 5, 6, 7], "upright kept \(resolved.kept)")
+    check(resolved.orphans == [3], "uncovered flipped is an orphan \(resolved.orphans)")
+    // A page that is mostly flipped is a rotated page: leave it alone.
+    lines = [flippedLine("a", 0, 0, 40, 30, 1), flippedLine("b", 0, 40, 40, 30, 1), line("c", 0, 80, 40, 30, 1)]
+    resolved = Orientation.resolve(lines)
+    check(resolved.kept == [0, 1, 2] && resolved.orphans.isEmpty, "rotated page untouched")
+}
+
+private func tableTests() {
+    // 1 header + 6 data rows x 5 short-cell columns, row pitch 60, height 30.
+    let xs: [Double] = [40, 300, 560, 820, 1080]
+    let widths: [Double] = [90, 60, 110, 150, 80]
+    var lines: [OCRLine] = []
+    let header = ["门店", "数量", "单价", "日期", "Qty"]
+    for (c, text) in header.enumerated() {
+        lines.append(line(text, xs[c], 40, widths[c] * 0.8, 30, 1))
+    }
+    for r in 0..<6 {
+        for c in 0..<5 {
+            let text = c == 0 ? "店\(r)" : "\(r)\(c)\(r * c)"
+            // Ragged widths and a few pixels of jitter, like real cells.
+            let w = widths[c] * (0.6 + 0.07 * Double((r + c) % 5))
+            lines.append(line(text, xs[c] + Double((r * 3 + c) % 4), 100 + Double(r) * 60 + Double(c % 2), w, 30, 1))
+        }
+    }
+    let table = LineMerge.group(lines)
+    check(table.rows.count == 7, "table rows \(table.rows.count): \(table.text)")
+    check(table.rows[0].text == header.joined(separator: "\t"), "header row \(table.rows[0].text)")
+    check(table.rows[1].text == "店0\t010\t020\t030\t040", "first data row \(table.rows[1].text)")
+    check(table.rows.allSatisfy { $0.text.split(separator: "\t").count == 5 }, "every row has 5 cells")
+
+    // Three columns of running prose line up row by row too; long cells keep it prose.
+    var prose: [OCRLine] = []
+    let sentence = "这是一段用于测试三栏排版的较长正文内容不是表格"
+    for r in 0..<8 {
+        for c in 0..<3 {
+            prose.append(line("\(sentence)\(c)\(r)", 60 + Double(c) * 820, 60 + Double(r) * 50, 700, 30, 1))
+        }
+    }
+    let page = LineMerge.group(prose)
+    check(!page.text.contains("\t"), "prose is not a table")
+    check(page.rows.count == 24, "prose rows \(page.rows.count)")
+    check(page.rows[0].text.hasSuffix("00") && page.rows[1].text.hasSuffix("01"), "prose reads down the first column \(page.rows[0].text) / \(page.rows[1].text)")
+
+    // Two short columns (key/value) are not a table either.
+    var pairs: [OCRLine] = []
+    for r in 0..<6 {
+        pairs.append(line("键\(r)", 40, 40 + Double(r) * 50, 60, 30, 1))
+        pairs.append(line("值\(r)", 400, 40 + Double(r) * 50, 60, 30, 1))
+    }
+    check(!LineMerge.group(pairs).text.contains("\t"), "two columns are not a table")
 }

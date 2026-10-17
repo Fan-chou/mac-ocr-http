@@ -139,3 +139,62 @@ public enum TilePolicy {
         return false
     }
 }
+
+/// Tile geometry for the second pass. Vision's accurate recognizer drops whole
+/// runs of lines once glyphs are under about 1% of the tile side, so a page of
+/// small glyphs gets smaller tiles. Large glyphs keep the classic 2048 grid.
+public enum AdaptiveTile {
+    public static let maxLength = 2048
+    public static let minLength = 1024
+    public static let baseOverlap = 256
+    /// Glyph height as a fraction of the tile side that Vision still reads.
+    public static let targetGlyphFrac = 0.011
+    /// A text line box is about 1.5 glyph heights tall. A shrunken tile
+    /// overlaps by three of them, never less than the classic 256.
+    public static let lineHeightPerGlyph = 1.5
+
+    /// `glyphPx` is the median glyph height in the bitmap that will be tiled.
+    public static func plan(glyphPx: Double) -> (length: Int, overlap: Int) {
+        guard glyphPx.isFinite, glyphPx > 0 else { return (maxLength, baseOverlap) }
+        let ideal = Int((glyphPx / targetGlyphFrac).rounded())
+        let length = min(max(ideal, minLength), maxLength)
+        // Three line heights, never below the classic 256. Full-size tiles keep
+        // exactly 256: a page that is tiled despite huge glyphs (a poster or a
+        // newspaper scan) would otherwise double its tile count for nothing,
+        // and seam stitching already handles lines cut at a 2048 seam.
+        let threeLines = Int((3 * lineHeightPerGlyph * glyphPx).rounded(.up))
+        let overlap = length >= maxLength ? baseOverlap : min(length / 2, max(baseOverlap, threeLines))
+        return (length, overlap)
+    }
+
+    /// Offsets along one axis. An axis no longer than `keepWholeUpTo` stays a
+    /// single span so short lines are not cut by a needless seam.
+    public static func spans(length: Int, tile: Int, overlap: Int, keepWholeUpTo: Int) -> [(offset: Int, length: Int)] {
+        if length <= max(tile, keepWholeUpTo) {
+            return [(0, max(length, 0))]
+        }
+        let step = max(1, tile - overlap)
+        var offsets = [0]
+        var cursor = 0
+        while cursor + tile < length {
+            let next = cursor + step
+            let last = length - tile
+            if next >= last {
+                if last > offsets[offsets.count - 1] {
+                    offsets.append(last)
+                }
+                break
+            }
+            offsets.append(next)
+            cursor = next
+        }
+        return offsets.map { ($0, tile) }
+    }
+
+    /// The cross axis may stay whole up to 1.3× the tile side (and never past
+    /// the 2048 cap): a 1700px-wide page with 15px glyphs still reads in full
+    /// width once its height is cut to about 1360.
+    public static func wholeAxisLimit(tile: Int) -> Int {
+        tile >= maxLength ? maxLength : min(maxLength, Int(Double(tile) * 1.3))
+    }
+}

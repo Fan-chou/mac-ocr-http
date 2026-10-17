@@ -244,13 +244,18 @@ private struct BuiltPage {
 /// A box that crosses a gutter is its own band and is not pushed into a column.
 private func buildPage(_ lines: [Node], median: Double) -> BuiltPage {
     let basis = median > 0 ? median : 16
-    let groups = layoutLines(lines, indices: Array(lines.indices), basis: basis)
+    var tables = Set<Int>()
+    let groups = layoutLines(lines, indices: Array(lines.indices), basis: basis, tables: &tables)
     var rows: [OCRRow] = []
     var blocks: [OCRBlock] = []
     for group in groups where !group.isEmpty {
         let start = rows.count
-        let gutters = localGutters(lines, indices: group, basis: basis)
-        rows.append(contentsOf: buildRows(lines, indices: group, basis: basis, gutters: gutters))
+        if let first = group.first, tables.contains(first) {
+            rows.append(contentsOf: buildTableRows(lines, indices: group, basis: basis))
+        } else {
+            let gutters = localGutters(lines, indices: group, basis: basis)
+            rows.append(contentsOf: buildRows(lines, indices: group, basis: basis, gutters: gutters))
+        }
         if rows.count > start, let block = blockBox(lines, rows: rows, range: start..<rows.count) {
             blocks.append(block)
         }
@@ -360,28 +365,34 @@ private func shortScrapOnRow(_ host: BBox, _ fragment: BBox, compactCount: Int, 
     return xOverlap(host, fragment) >= 0.8 * fragment.width
 }
 
-private func layoutLines(_ lines: [Node], indices: [Int], basis: Double) -> [[Int]] {
+/// `tables` collects the first index of every group that is a grid table.
+private func layoutLines(_ lines: [Node], indices: [Int], basis: Double, tables: inout Set<Int>) -> [[Int]] {
     if indices.count <= 1 {
         return indices.isEmpty ? [] : [indices]
     }
+    if isTable(lines, indices: indices, basis: basis) {
+        let ordered = indices.sorted { lines[$0].centerY < lines[$1].centerY }
+        if let first = ordered.first { tables.insert(first) }
+        return [ordered]
+    }
     let slices = horizontalSlices(lines, indices: indices, basis: basis)
     if slices.count >= 2 {
-        return slices.flatMap { layoutLines(lines, indices: $0, basis: basis) }
+        return slices.flatMap { layoutLines(lines, indices: $0, basis: basis, tables: &tables) }
     }
     if let pieces = splitVotedColumns(lines, indices: indices, basis: basis) {
-        return pieces.flatMap { layoutLines(lines, indices: $0, basis: basis) }
+        return pieces.flatMap { layoutLines(lines, indices: $0, basis: basis, tables: &tables) }
     }
     let gutters = localGutters(lines, indices: indices, basis: basis)
     let spanning = indices.filter { crossesGutter(lines[$0].line.bbox, gutters) }
     if !spanning.isEmpty {
         let bands = bandsAroundSpanning(lines, indices: indices, spanning: spanning, basis: basis)
         if bands.count >= 2, bands.allSatisfy({ $0.count < indices.count }) {
-            return bands.flatMap { layoutLines(lines, indices: $0, basis: basis) }
+            return bands.flatMap { layoutLines(lines, indices: $0, basis: basis, tables: &tables) }
         }
     }
     let columns = columnBlocks(lines, indices: indices, basis: basis)
     if columns.count >= 2, columns.allSatisfy({ $0.count < indices.count }) {
-        return columns.flatMap { layoutLines(lines, indices: $0, basis: basis) }
+        return columns.flatMap { layoutLines(lines, indices: $0, basis: basis, tables: &tables) }
     }
     return [indices]
 }
@@ -1055,7 +1066,7 @@ private func joinsBand(_ node: Node, members: [Int], lines: [Node], basis: Doubl
     return (closeToCenter || overlapsBand) && spread <= spreadLimit
 }
 
-private func makeRow(_ lines: [Node], _ indices: [Int]) -> OCRRow? {
+private func makeRow(_ lines: [Node], _ indices: [Int], separator: String? = nil) -> OCRRow? {
     guard !indices.isEmpty else { return nil }
     let order = indices.sorted { lhs, rhs in
         let leftX = lines[lhs].line.bbox.x
@@ -1110,6 +1121,8 @@ private func makeRow(_ lines: [Node], _ indices: [Int]) -> OCRRow? {
         if !piece.isEmpty {
             if text.isEmpty {
                 text = piece
+            } else if let separator {
+                text += separator + piece
             } else if let last = text.last, let first = piece.first, isCJK(last), isCJK(first) {
                 text += piece
             } else {
@@ -1438,4 +1451,96 @@ private func seamDistance(_ box: BBox, tile: TileFrame?, strip: Strip) -> Double
         return (tile.y + tile.height) - center
     }
     return center - tile.y
+}
+
+
+// MARK: - Grid tables
+
+/// A grid table: at least three text rows whose cells fall into at least three
+/// shared columns, one cell per column, with short cells. Three columns of
+/// running prose also line up row by row, so long cells (median above
+/// `tableMaxCellChars`) never count as a table.
+let tableMaxCellChars = 16
+
+private func isTable(_ lines: [Node], indices: [Int], basis: Double) -> Bool {
+    guard indices.count >= 9 else { return false }
+    let bands = textRows(lines, indices: indices, basis: basis)
+    let multi = bands.filter { $0.count >= 3 }
+    guard multi.count >= 3 else { return false }
+    let columns = tableColumns(lines, rows: multi)
+    guard columns.count >= 3 else { return false }
+    var alignedRows = 0
+    var alignedLines = 0
+    var cellChars: [Int] = []
+    for row in multi {
+        var used = Set<Int>()
+        var ok = true
+        for index in row {
+            guard let column = tableColumn(lines[index].line.bbox, columns) , !used.contains(column) else {
+                ok = false
+                break
+            }
+            used.insert(column)
+        }
+        if ok && used.count >= 3 {
+            alignedRows += 1
+            alignedLines += row.count
+            for index in row {
+                cellChars.append(lines[index].key.count)
+            }
+        }
+    }
+    guard alignedRows >= 3, Double(alignedRows) >= 0.7 * Double(multi.count) else { return false }
+    guard Double(alignedLines) >= 0.6 * Double(indices.count) else { return false }
+    let sortedChars = cellChars.sorted()
+    let medianChars = sortedChars.isEmpty ? 0 : sortedChars[sortedChars.count / 2]
+    return medianChars <= tableMaxCellChars
+}
+
+/// Column x-ranges: the union of cell extents over the multi-cell rows.
+private func tableColumns(_ lines: [Node], rows: [[Int]]) -> [(Double, Double)] {
+    var spans: [(Double, Double)] = []
+    for row in rows {
+        for index in row {
+            let box = lines[index].line.bbox
+            spans.append((box.x, box.x + box.width))
+        }
+    }
+    spans.sort { $0.0 < $1.0 }
+    var merged: [(Double, Double)] = []
+    for span in spans {
+        if let last = merged.last, span.0 <= last.1 {
+            merged[merged.count - 1].1 = max(last.1, span.1)
+        } else {
+            merged.append(span)
+        }
+    }
+    return merged
+}
+
+private func tableColumn(_ box: BBox, _ columns: [(Double, Double)]) -> Int? {
+    let center = box.x + box.width / 2
+    for (offset, column) in columns.enumerated() where center >= column.0 && center <= column.1 {
+        return offset
+    }
+    return nil
+}
+
+/// Rows across the whole table, cells left to right joined by a tab. No gap
+/// or gutter splits a table row.
+private func buildTableRows(_ lines: [Node], indices: [Int], basis: Double) -> [OCRRow] {
+    let ordered = indices.sorted { lhs, rhs in
+        if lines[lhs].centerY != lines[rhs].centerY { return lines[lhs].centerY < lines[rhs].centerY }
+        return lines[lhs].line.bbox.x < lines[rhs].line.bbox.x
+    }
+    let spreadLimit = basis * 1.25
+    var bands: [[Int]] = []
+    for index in ordered {
+        if let last = bands.indices.last, joinsBand(lines[index], members: bands[last], lines: lines, basis: basis, spreadLimit: spreadLimit) {
+            bands[last].append(index)
+        } else {
+            bands.append([index])
+        }
+    }
+    return bands.compactMap { makeRow(lines, $0, separator: "\t") }
 }
