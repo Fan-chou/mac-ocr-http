@@ -78,6 +78,8 @@ private func run() {
     coveredSeamScrap()
     seamGapStays()
     gutterBeatsSeam()
+    stackedLinesInOneColumn()
+    codePunctFold()
     timing()
     fixturePages()
     columnReadingOrder()
@@ -186,6 +188,28 @@ private func seamGapStays() {
     )
     check(clipped.rows.count == 1, "clipped seam split \(clipped.rows.count) \(clipped.text)")
     check(clipped.text.contains("LEFT") && clipped.text.contains("RIGHT"), "clipped seam text \(clipped.text)")
+}
+
+/// Two different lines a third of a line apart, seen by tiles stacked in one
+/// column, stay two rows and keep their full text.
+private func stackedLinesInOneColumn() {
+    let top = TileFrame(x: 0, y: 0, width: 2048, height: 2048)
+    let bottom = TileFrame(x: 0, y: 1792, width: 2048, height: 2048)
+    let page = LineMerge.assemble([
+        line("上面一行的文字内容", 100, 1900, 1800, 40, 0.9),
+        line("下面一行完全不同的句子", 100, 1915, 1800, 40, 0.9),
+        line("别处", 100, 2400, 300, 40, 0.9),
+    ], tiles: [top, bottom, bottom])
+    check(page.text.contains("上面一行的文字内容"), "stacked upper kept \(page.text)")
+    check(page.text.contains("下面一行完全不同的句子"), "stacked lower kept \(page.text)")
+}
+
+/// Full-width punctuation folds to ASCII only on lines without CJK text.
+private func codePunctFold() {
+    check(CodePunct.fold("def merge（rows: List［dict］，key=\"id\"）-> dict：") == "def merge(rows: List[dict],key=\"id\")-> dict:", "code line folded")
+    check(CodePunct.fold("你好（世界）：a b c") == "你好（世界）：a b c", "CJK line untouched")
+    check(CodePunct.fold("ok：") == "ok：", "short line untouched")
+    check(CodePunct.fold("ＡＢＣ abc （x）") == "ＡＢＣ abc (x)", "full-width letters kept")
 }
 
 /// A real column gutter splits even when the right fragment starts on its tile edge.

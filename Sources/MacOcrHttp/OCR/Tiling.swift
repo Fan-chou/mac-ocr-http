@@ -399,7 +399,7 @@ enum ImageOCR {
         let page = tiles == 1
             ? LineMerge.group(lines)
             : LineMerge.assemble(lines, tiles: frames)
-        let scripted = applyScript(page, script)
+        let scripted = applyCodePunct(applyScript(page, script))
         let elapsed = max(0, Int(Date().timeIntervalSince(started) * 1000))
         return OCRPayload(
             text: scripted.text,

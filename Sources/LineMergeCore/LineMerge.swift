@@ -514,7 +514,8 @@ private func buildRows(_ lines: [Node], indices: [Int], basis: Double, gutters: 
     let spreadLimit = basis * 1.25
     var bands: [[Int]] = []
     for index in ordered {
-        if let last = bands.indices.last, joinsBand(lines[index], members: bands[last], lines: lines, basis: basis, spreadLimit: spreadLimit) {
+        if let last = bands.indices.last, joinsBand(lines[index], members: bands[last], lines: lines, basis: basis, spreadLimit: spreadLimit),
+           !stackedConflict(lines[index], members: bands[last], lines: lines, basis: basis) {
             bands[last].append(index)
         } else {
             bands.append([index])
@@ -1108,7 +1109,15 @@ private func makeRow(_ lines: [Node], _ indices: [Int], separator: String? = nil
             }
         }
         piece = piece.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !piece.isEmpty, overlapped, !textKey.isEmpty, cut > 0, cut < count {
+        var aligned = false
+        if overlapped, !text.isEmpty, cut > 0, cut < count,
+           let seam = seamAlign(text: text, raw: raw, headLimit: cut + 8, cut: cut) {
+            text = seam.text
+            textKey = LineMerge.matchKey(text)
+            piece = seam.piece.trimmingCharacters(in: .whitespacesAndNewlines)
+            aligned = true
+        }
+        if !aligned, !piece.isEmpty, overlapped, !textKey.isEmpty, cut > 0, cut < count {
             let pieceKey = LineMerge.matchKey(piece)
             let shared = sharedAffixCount(textKey, pieceKey, minimum: 2, cap: 6)
             if shared >= 2 {
@@ -1536,11 +1545,113 @@ private func buildTableRows(_ lines: [Node], indices: [Int], basis: Double) -> [
     let spreadLimit = basis * 1.25
     var bands: [[Int]] = []
     for index in ordered {
-        if let last = bands.indices.last, joinsBand(lines[index], members: bands[last], lines: lines, basis: basis, spreadLimit: spreadLimit) {
+        if let last = bands.indices.last, joinsBand(lines[index], members: bands[last], lines: lines, basis: basis, spreadLimit: spreadLimit),
+           !stackedConflict(lines[index], members: bands[last], lines: lines, basis: basis) {
             bands[last].append(index)
         } else {
             bands.append([index])
         }
     }
     return bands.compactMap { makeRow(lines, $0, separator: "\t") }
+}
+
+
+// MARK: - Seam reconciliation
+
+/// Two observations of one text line that overlap in x (tile seam, slanted
+/// photo) are stitched on their longest shared run of at least three
+/// non-space characters, searched in the last 24 characters already emitted
+/// and the first `headLimit` characters of the new piece. The per-character
+/// geometric cut misplaces the join on a slanted line ("和四种： 和四种转换").
+/// At most three characters may follow the match in the emitted text; they
+/// are dropped only when all are punctuation or symbols. The run must occur
+/// exactly once on each side, and the stitched join may move at most four
+/// characters from the geometric cut (repeating text aligns a period away).
+private func seamAlign(text: String, raw: String, headLimit: Int, cut: Int) -> (text: String, piece: String)? {
+    let t = Array(text)
+    let r = Array(raw)
+    let tTail = Array(t.indices.filter { !t[$0].isWhitespace }.suffix(24))
+    let rHead = Array(r.indices.filter { !r[$0].isWhitespace }.prefix(max(0, headLimit)))
+    guard tTail.count >= 3, rHead.count >= 3 else { return nil }
+    func norm(_ c: Character) -> String { String(c).precomposedStringWithCompatibilityMapping.lowercased() }
+    let a = tTail.map { norm(t[$0]) }
+    let b = rHead.map { norm(r[$0]) }
+    var best = 0
+    var endA = 0
+    var endB = 0
+    var prev = Array(repeating: 0, count: b.count + 1)
+    for i in 1...a.count {
+        var cur = Array(repeating: 0, count: b.count + 1)
+        for j in 1...b.count where a[i - 1] == b[j - 1] {
+            cur[j] = prev[j - 1] + 1
+            if cur[j] >= best {
+                best = cur[j]
+                endA = i
+                endB = j
+            }
+        }
+        prev = cur
+    }
+    guard best >= 3, a.count - endA <= 3 else { return nil }
+    // Repeating text ("金额 100 元 金额 100 元") matches at several offsets;
+    // an ambiguous run would drop real text, so keep the geometric cut then.
+    let run = Array(a[(endA - best)..<endA])
+    func occurrences(_ hay: [String]) -> Int {
+        guard hay.count >= run.count else { return 0 }
+        return (0...(hay.count - run.count)).filter { Array(hay[$0..<($0 + run.count)]) == run }.count
+    }
+    guard occurrences(b) == 1, occurrences(a) == 1 else { return nil }
+    // Trailing punctuation after the match is seam junk ("和四种：") and goes.
+    // Letters, digits or CJK after it are real text that the new piece only
+    // partly repeats; they stay.
+    let trailing = t[(tTail[endA - 1] + 1)...].filter { !$0.isWhitespace }
+    let junk = trailing.allSatisfy { $0.isPunctuation || $0.isSymbol }
+    let keep = junk ? tTail[endA - 1] + 1 : t.count
+    // Kept trailing text may stand for as many characters of the new piece
+    // ("先週后" + "先调后买": the match is "先", "週后" covers "调后") or be a
+    // misread extra ("互联发1" + "互联发货组"). Take whichever join lands
+    // nearer the geometric cut; on a tie keep the piece whole.
+    var start = rHead[endB - 1] + 1
+    if !junk {
+        var skipped = start
+        var skip = trailing.count
+        while skip > 0, skipped < r.count {
+            if !r[skipped].isWhitespace { skip -= 1 }
+            skipped += 1
+        }
+        if abs(skipped - cut) < abs(start - cut) { start = skipped }
+    }
+    guard abs(start - cut) <= 4 else { return nil }
+    return (String(t[..<keep]), start < r.count ? String(r[start...]) : "")
+}
+
+/// A full-height fragment does not join a row band when it sits under a
+/// different full-height line of that band: at least half of the narrower
+/// width shared in x, centers at least a quarter line apart, texts unequal,
+/// and both from one Vision pass or one tile column (side-by-side tiles only
+/// when the overlap is wider than their seam strip plus a line).
+/// On a slanted photo the right-tile copy of a line otherwise joins the line
+/// above and its text is trimmed away as covered.
+private func stackedConflict(_ node: Node, members: [Int], lines: [Node], basis: Double) -> Bool {
+    let box = node.line.bbox
+    guard box.height >= 0.6 * basis else { return false }
+    for member in members {
+        let other = lines[member]
+        let otherBox = other.line.bbox
+        guard otherBox.height >= 0.6 * basis else { continue }
+        let minWidth = min(box.width, otherBox.width)
+        let overlap = xOverlap(box, otherBox)
+        guard minWidth > 0, overlap >= 0.5 * minWidth else { continue }
+        guard abs(node.centerY - other.centerY) >= 0.25 * basis else { continue }
+        if textsMatch(node.key, other.key) { continue }
+        // Halves of one line cut by side-by-side tiles overlap only inside
+        // the shared seam strip. Tiles stacked in one column each see the
+        // whole line, so stacked boxes there are two different lines.
+        if let tileA = node.tile, let tileB = other.tile, abs(tileA.x - tileB.x) > 0.5 {
+            let strip = max(0, min(tileA.maxX, tileB.maxX) - max(tileA.x, tileB.x))
+            if overlap <= strip + basis { continue }
+        }
+        return true
+    }
+    return false
 }

@@ -88,7 +88,7 @@ private func recognizeDocument(
         scaleY: scaleY
     )
     let page = PageText(lines: mapped.lines, rows: mapped.rows, blocks: mapped.blocks, text: mapped.text)
-    let scripted = applyScript(page, script)
+    let scripted = applyCodePunct(applyScript(page, script))
     let measured = TilePolicy.measure(
         width: decoded.originalWidth,
         height: decoded.originalHeight,

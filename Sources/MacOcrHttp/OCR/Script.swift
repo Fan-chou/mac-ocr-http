@@ -38,3 +38,14 @@ func applyScript(_ page: PageText, _ script: ScriptMode) -> PageText {
         text: rows.map(\.text).joined(separator: "\n")
     )
 }
+
+/// Folds full-width punctuation on code-like lines (no CJK) to ASCII.
+func applyCodePunct(_ page: PageText) -> PageText {
+    let lines = page.lines.map { line in
+        OCRLine(text: CodePunct.fold(line.text), confidence: line.confidence, bbox: line.bbox, quad: line.quad)
+    }
+    let rows = page.rows.map { row in
+        OCRRow(text: CodePunct.fold(row.text), bbox: row.bbox, confidence: row.confidence, lineIndices: row.lineIndices)
+    }
+    return PageText(lines: lines, rows: rows, blocks: page.blocks, text: CodePunct.foldText(page.text))
+}
