@@ -83,7 +83,7 @@ final class HTTPServer: @unchecked Sendable {
     let config: AppConfig
     private let auth: BearerAuth
     private let admission: OCRAdmission
-    private let vision: VisionPool
+    private let vision: WorkerPool
 
     init(config: AppConfig) {
         self.config = config
@@ -93,7 +93,12 @@ final class HTTPServer: @unchecked Sendable {
             capacity: config.queueMax,
             timeout: TimeInterval(config.queueTimeoutMs) / 1000
         )
-        self.vision = VisionPool(workers: config.visionWorkers)
+        self.vision = WorkerPool(settings: WorkerPool.Settings(
+            workers: config.visionWorkers,
+            timeoutMs: config.workerTimeoutMs,
+            maxTasks: config.workerMaxTasks,
+            maxAgeSeconds: config.workerMaxAgeSeconds
+        ))
         self.slots = DispatchSemaphore(value: config.queueMax + config.visionWorkers + 16)
         if let dir = config.debugCaptureDir {
             self.debugStore = DebugCaptureStore(directory: dir, maxCount: config.debugCaptureMax)
@@ -126,6 +131,8 @@ final class HTTPServer: @unchecked Sendable {
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
             source.setEventHandler { [weak self] in
                 self?.closeAllListeners()
+                // Workers first: SIGTERM, 3 s grace, SIGKILL, reap. Then exit.
+                self?.vision.shutdown(grace: 3)
                 Darwin.exit(0)
             }
             source.resume()
@@ -133,6 +140,8 @@ final class HTTPServer: @unchecked Sendable {
         }
 
         log("mac-ocr-http starting hosts=\(config.hosts.joined(separator: ",")) port=\(config.port) workers=\(config.visionWorkers) queue=\(config.queueMax) model=\(config.openAIModel)")
+        log("recognition runs in \(config.visionWorkers) worker process(es): timeout=\(config.workerTimeoutMs)ms maxTasks=\(config.workerMaxTasks) maxAge=\(config.workerMaxAgeSeconds)s")
+        vision.start()
         if let dir = config.debugCaptureDir {
             log("debug capture on dir=\(dir) max=\(config.debugCaptureMax) (stores request images on disk)")
         }
@@ -484,7 +493,7 @@ final class HTTPServer: @unchecked Sendable {
             queued: snap.queued,
             rejected: snap.rejected,
             workers: config.visionWorkers,
-            rssBytes: physicalFootprint()
+            rssBytes: physicalFootprint() + vision.workerFootprintBytes()
         ))
     }
 

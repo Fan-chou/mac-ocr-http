@@ -1,74 +1,45 @@
+import CoreGraphics
+import CoreText
 import Foundation
 import Vision
 
-/// One serial queue per worker. `recognize` does not `await` and does not hop
-/// through an actor: the body runs synchronously on that queue, so worker N
-/// cannot start a second `VNImageRequestHandler.perform`.
-final class VisionPool: @unchecked Sendable {
-    private let queues: [DispatchQueue]
+/// Runs inside an `--ocr-worker` child process (see `Worker/`). The worker
+/// calls `recognize` from its one serial queue, so a child never has two
+/// `VNImageRequestHandler.perform` calls in flight. The body is synchronous:
+/// no `await`, no actor hop.
+final class VisionRecognizer: @unchecked Sendable {
     private let languages = LanguageCache()
 
-    init(workers: Int) {
-        let count = max(1, workers)
-        queues = (0..<count).map { index in
-            DispatchQueue(label: "macocr.vision.\(index)")
-        }
-    }
-
     func recognize(
-        on index: Int,
         holder: DataHolder,
         job: OCRJob,
         maxPixels: Int,
         maxPixel: Int,
         minGlyphFrac: Double
     ) throws -> OCRPayload {
-        let queue = queues[index]
-        var result: Result<OCRPayload, Error>?
         let longEdge: Int? = job.scale == .downscale ? (job.maxPixel ?? maxPixel) : nil
-        queue.sync {
-            result = autoreleasepool { () -> Result<OCRPayload, Error> in
-                let started = Date()
-                let decoded: DecodedImage
-                do {
-                    decoded = try autoreleasepool {
-                        let bytes = holder.data
-                        holder.data = Data()
-                        return try decodeImage(bytes, maxPixels: maxPixels, longEdge: longEdge)
-                    }
-                } catch {
-                    return .failure(error)
-                }
-                do {
-                    let payload = try autoreleasepool {
-                        try self.recognize(decoded: decoded, job: job, started: started, minGlyphFrac: minGlyphFrac)
-                    }
-                    return .success(payload)
-                } catch {
-                    return .failure(error)
-                }
+        return try autoreleasepool { () throws -> OCRPayload in
+            let started = Date()
+            let decoded = try autoreleasepool { () throws -> DecodedImage in
+                let local = holder.data
+                holder.data = Data()
+                return try decodeImage(local, maxPixels: maxPixels, longEdge: longEdge)
             }
-        }
-        switch result {
-        case .success(let payload):
-            return payload
-        case .failure(let error):
-            throw error
-        case .none:
-            throw OCREngineError.vision("missing OCR result")
+            return try autoreleasepool {
+                try self.recognize(decoded: decoded, job: job, started: started, minGlyphFrac: minGlyphFrac)
+            }
         }
     }
 
-    func languageCatalog() throws -> LanguageCatalog {
+    /// Loads the default-language model once so the first real request in a
+    /// fresh worker is not slower than in a warm one. Errors are ignored: a
+    /// real request on a broken worker fails and is retried on a new one.
+    func warmUp() {
         autoreleasepool {
-            let accurate = languages.languages(fast: false)
-            let fast = languages.languages(fast: true)
-            return LanguageCatalog(
-                ok: true,
-                defaults: defaultRecognitionLanguages,
-                accurate: orderedSupported(accurate),
-                fast: orderedSupported(fast)
-            )
+            _ = languages.languages(fast: false)
+            guard let image = warmUpImage() else { return }
+            let selected = defaultRecognitionLanguages.filter { languages.languages(fast: false).contains($0) }
+            _ = try? OCREngine.lines(image: image, languages: selected, level: .accurate)
         }
     }
 
@@ -100,11 +71,48 @@ final class VisionPool: @unchecked Sendable {
     }
 }
 
+/// A small black-on-white bitmap with a few CJK and Latin glyphs, drawn with
+/// CoreText, so warm-up loads the recognizer and not only the detector.
+private func warmUpImage() -> CGImage? {
+    let width = 480, height = 96
+    guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+          let context = CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+          ) else { return nil }
+    context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    let font = CTFontCreateWithName("PingFang SC" as CFString, 40, nil)
+    let attributes: [NSAttributedString.Key: Any] = [
+        NSAttributedString.Key(kCTFontAttributeName as String): font,
+        NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(red: 0, green: 0, blue: 0, alpha: 1),
+    ]
+    let line = CTLineCreateWithAttributedString(NSAttributedString(string: "文字识别 OCR 2048", attributes: attributes))
+    context.textPosition = CGPoint(x: 16, y: 30)
+    CTLineDraw(line, context)
+    return context.makeImage()
+}
+
 /// Holds image bytes so the HTTP body can be released, and these bytes can be
 /// dropped after decode, before `perform`.
 final class DataHolder: @unchecked Sendable {
     var data: Data
     init(_ data: Data) { self.data = data }
+}
+
+extension LanguageCache {
+    /// `GET /languages`. Listing languages does not run recognition, so the
+    /// HTTP process answers it without a worker round trip.
+    func catalog() -> LanguageCatalog {
+        autoreleasepool {
+            LanguageCatalog(
+                ok: true,
+                defaults: defaultRecognitionLanguages,
+                accurate: orderedSupported(languages(fast: false)),
+                fast: orderedSupported(languages(fast: true))
+            )
+        }
+    }
 }
 
 /// Supported-language lists are the only cross-request cache.

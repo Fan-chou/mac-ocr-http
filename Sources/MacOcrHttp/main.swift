@@ -1,6 +1,10 @@
 import Darwin
 import Foundation
 
+if WorkerMain.isWorkerInvocation(CommandLine.arguments) {
+    WorkerMain.run(CommandLine.arguments)
+}
+
 do {
     let config = try AppConfig.load()
     let server = HTTPServer(config: config)

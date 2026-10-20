@@ -48,7 +48,10 @@ Token lookup order: `OCR_HTTP_TOKEN`, then `OCR_HTTP_TOKEN_FILE`, then `~/Librar
 | `OCR_HTTP_MAX_BODY_BYTES` | 20971520 (clamped to 1–32 MiB) |
 | `OCR_HTTP_MAX_PIXELS` | 100000000 (clamped to 1000000–200000000). Refuses the image; does not shrink it. |
 | `OCR_HTTP_MAX_PIXEL` | 4096 (clamped to 1024–8192). Long edge only when `scale=downscale`. |
-| `OCR_HTTP_VISION_WORKERS` | `2` (clamped to 1–4). Each worker is one serial queue and one `VNImageRequestHandler` at a time. Tiles of one image stay on that queue. |
+| `OCR_HTTP_VISION_WORKERS` | `2` (clamped to 1–4). Number of recognition worker processes. Each runs one `VNImageRequestHandler` at a time; tiles of one image stay in that process. See [Worker processes](#worker-processes). |
+| `OCR_HTTP_WORKER_TIMEOUT_MS` | `300000` (clamped to 5000–600000). Deadline for one recognition in a worker. Past it the worker is killed and the request is retried once on a fresh one. |
+| `OCR_HTTP_WORKER_MAX_TASKS` | `500`. A worker is replaced (in the background) after this many requests. |
+| `OCR_HTTP_WORKER_MAX_AGE_S` | `3600` (clamped to 60–604800). An idle worker older than this, by wall clock (so time asleep counts), is replaced. |
 | `OCR_HTTP_QUEUE_MAX` | `64` (clamped to 1–256). Requests wait for a worker instead of failing immediately. |
 | `OCR_HTTP_QUEUE_TIMEOUT_MS` | `180000` (clamped to 1–300000) |
 | `OCR_HTTP_TILE_MIN_GLYPH_FRAC` | `0.012` (clamped to 0.001–0.2). `scale=auto` tiles when glyph size / long side is below this. `OCR_HTTP_TILE_MIN_TEXT_FRAC` is a deprecated alias, used only when the new variable is unset. |
@@ -95,7 +98,7 @@ Firewall: the macOS application firewall was off when this was set up, so nothin
 
 `GET /health` → `200` `{"ok":true}`. Unauthenticated and cheap. It does not read counters.
 
-`GET /stats` → Bearer. `inFlight`, `queued`, `rejected`, `workers`, and `rssBytes` (`task_info` `phys_footprint`).
+`GET /stats` → Bearer. `inFlight`, `queued`, `rejected`, `workers`, and `rssBytes` (`phys_footprint` of the HTTP process plus every worker process).
 
 `GET /languages` → Bearer. `defaults` lists `zh-Hans`, `en-US`. `accurate` and `fast` are the Vision catalogs on this Mac, with those two first when present.
 
@@ -200,7 +203,7 @@ Errors use a non-200 status and `{"ok":false,"error":"..."}`: `400` bad input (i
 {"ok":false,"error":"image too large","maxPixels":100000000,"width":12000,"height":9000}
 ```
 
-Dimensions are read from the image header before the bitmap is allocated. `503` with `Retry-After: 1` means the wait queue is already full (`"queue full"`) or the caller waited `OCR_HTTP_QUEUE_TIMEOUT_MS` without a free worker (`"queue wait timed out"`). `/v1/*` uses the same 503 and `Retry-After`, with an OpenAI error object instead of `{"ok":false}`. A request that finds a free worker, or a free queue slot, is not rejected. Vision work runs on `OCR_HTTP_VISION_WORKERS` serial queues (default 2), not an unbounded GCD fan-out. Connection threads are capped at queue size + worker count + 16, shared across all listen addresses, so every queued request has a thread and that thread blocks on a condition instead of spinning. `GET /health` does not enter the OCR queue; the extra 16 slots keep it from waiting out a full queue.
+Dimensions are read from the image header before the bitmap is allocated. `503` with `Retry-After: 1` means the wait queue is already full (`"queue full"`) or the caller waited `OCR_HTTP_QUEUE_TIMEOUT_MS` without a free worker (`"queue wait timed out"`). `/v1/*` uses the same 503 and `Retry-After`, with an OpenAI error object instead of `{"ok":false}`. A request that finds a free worker, or a free queue slot, is not rejected. Vision work runs in `OCR_HTTP_VISION_WORKERS` worker processes (default 2), one request at a time each, not an unbounded GCD fan-out. Connection threads are capped at queue size + worker count + 16, shared across all listen addresses, so every queued request has a thread and that thread blocks on a condition instead of spinning. `GET /health` does not enter the OCR queue; the extra 16 slots keep it from waiting out a full queue.
 
 ## OpenAI-compatible API
 
@@ -264,6 +267,24 @@ OCR_HTTP_TOKEN="$(cat "${HOME}/Library/Application Support/MacOcrHttp/token")" \
   python3 scripts/openai_client_test.py
 ```
 
+## Worker processes
+
+The HTTP process only parses, authenticates and queues. Image decoding and Vision run in `OCR_HTTP_VISION_WORKERS` resident child processes: the same binary started as `mac-ocr-http --ocr-worker --parent-pid <pid> --slot <n>`. They show up in `ps` under the server. Each admission slot owns one worker. The request goes down a pipe as a JSON header plus the raw image bytes; the result comes back as JSON on a second pipe. The token is removed from the worker environment, and the worker inherits no sockets.
+
+Why: a long-lived process can get into a state where every Vision call fails until it restarts. On 2026-10-20 a server that had been up for a day, across several sleep/wake cycles, answered every `/ocr` with `500 vision recognition failed: TextRecognition.CRImageReaderError error 1` (system log: `E5RT ... precompiled_compute_operation ... (Code: 13)`), while a fresh process recognised the same images. Now that only costs one worker.
+
+When a worker returns a Vision error, crashes, closes its pipe, or misses `OCR_HTTP_WORKER_TIMEOUT_MS`, the server SIGKILLs it, reaps it, starts a fresh worker, and retries the request once there. The client sees one normal response. Only if the retry fails too does it get the usual error (`500`, never `200`). Bad input (`400`, `413`, `415`) is not retried. Workers are also replaced after `OCR_HTTP_WORKER_MAX_TASKS` requests, and an idle worker older than `OCR_HTTP_WORKER_MAX_AGE_S`, so the first request after a long sleep usually lands on a fresh process. A new worker warms the recognizer up on a small drawn image before it takes work.
+
+No zombies, no orphans:
+
+- every exited worker is reaped with `waitpid` exactly once, from a kqueue process-exit watch, a 5-second sweep, or the request thread that killed it;
+- a worker exits by itself the moment the server dies, even mid-recognition (kqueue `NOTE_EXIT` on the parent pid), and on EOF of its request pipe;
+- on `SIGTERM`/`SIGINT` (including `launchctl kickstart -k` and `bootout`) the server closes its listeners, sends `SIGTERM` to the workers, waits up to 3 s, `SIGKILL`s any left, reaps them all, then exits.
+
+Server log lines start with `worker[<slot>] pid=<pid>` (`spawned`, `failed on attempt 1 (...); killed and reaped (...); retrying on a fresh worker`, `recycled`, `exited while idle`).
+
+For tests only, `OCR_HTTP_WORKER_FAULT` makes workers fail on purpose: `crash:N` (abort), `exit:N`, `hang:N`, `hangterm:N` (hang and ignore `SIGTERM`), or `vision:N` (return `CRImageReaderError`), on every Nth task of each worker. `N=1` fails the retry too. The server logs a warning when it is set. Never set it in the LaunchAgent.
+
 ## Debug capture
 
 Off by default. Set `OCR_HTTP_DEBUG_CAPTURE_DIR` to a directory and the server stores every OCR request from `POST /ocr`, `POST /v1/chat/completions`, and `POST /v1/responses` there. This is a debugging aid: it writes the user's images to disk.
@@ -313,7 +334,7 @@ swift run mac-ocr-line-merge-tests
 
 ## Memory
 
-Each decode and each tile `perform` runs inside `autoreleasepool`. ImageIO is asked not to cache decoded buffers (`kCGImageSourceShouldCache` is false; `ShouldCacheImmediately` is not set). The bitmap is copied into a private buffer and the image source is dropped before recognition. Each tile crop is its own copy and is released before the next tile. A base64 JSON body is decoded once; that JSON text is released before the worker runs, and the compressed bytes are released after the bitmap copy, before `perform`. The only cache kept across requests is the supported-language lists. `rssBytes` on `GET /stats` is the number to watch: after a load it should sit on a plateau, not climb with request count. The tile path stays at the original resolution. `scale=auto` may draw an extra probe bitmap whose long side is at most 4096; that copy is released before tiling. The safety cap is `OCR_HTTP_MAX_PIXELS` (default 100000000, about 400MB of RGBA). Vision models stay in the OS and are not downloaded by this server.
+Each decode and each tile `perform` runs inside `autoreleasepool`. ImageIO is asked not to cache decoded buffers (`kCGImageSourceShouldCache` is false; `ShouldCacheImmediately` is not set). The bitmap is copied into a private buffer and the image source is dropped before recognition. Each tile crop is its own copy and is released before the next tile. A base64 JSON body is decoded once; that JSON text is released before the worker runs. The HTTP process keeps the compressed bytes until the worker answers, so it can retry on a fresh worker; the worker releases its copy after the bitmap copy, before `perform`. The only cache kept across requests is the supported-language lists. `rssBytes` on `GET /stats` is the number to watch: after a load it should sit on a plateau, not climb with request count. The tile path stays at the original resolution. `scale=auto` may draw an extra probe bitmap whose long side is at most 4096; that copy is released before tiling. The safety cap is `OCR_HTTP_MAX_PIXELS` (default 100000000, about 400MB of RGBA). Vision models stay in the OS and are not downloaded by this server.
 
 ## Large fixture
 

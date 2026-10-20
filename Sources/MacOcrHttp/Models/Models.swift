@@ -1,12 +1,12 @@
 import Foundation
 import LineMergeCore
 
-enum RecognitionLevel: String, Sendable {
+enum RecognitionLevel: String, Codable, Sendable {
     case accurate
     case fast
 }
 
-enum ScaleMode: String, Sendable {
+enum ScaleMode: String, Codable, Sendable {
     /// One whole-image pass, then tile only when the page is large and the text is small.
     case auto
     /// Full resolution. Tile when either side is longer than 2048. No probe pass.
@@ -15,22 +15,22 @@ enum ScaleMode: String, Sendable {
     case downscale
 }
 
-enum TileForce: String, Sendable {
+enum TileForce: String, Codable, Sendable {
     case whole
     case tile
 }
 
-enum ScriptMode: String, Sendable {
+enum ScriptMode: String, Codable, Sendable {
     case hans
     case auto
 }
 
-enum LayoutMode: String, Sendable {
+enum LayoutMode: String, Codable, Sendable {
     case rows
     case document
 }
 
-struct OCRJob: Sendable {
+struct OCRJob: Codable, Sendable {
     var level: RecognitionLevel
     /// nil means the server default (`zh-Hans`, `en-US`, filtered to what Vision supports).
     var languages: [String]?
@@ -50,12 +50,13 @@ struct OCRJob: Sendable {
 
 let defaultRecognitionLanguages = ["zh-Hans", "en-US"]
 
-struct RecognitionEcho: Sendable {
+struct RecognitionEcho: Codable, Sendable {
     var languages: [String]
     var revision: Int
 }
 
-struct OCRPayload: Sendable {
+/// Crosses the worker pipe as JSON; every field round-trips exactly.
+struct OCRPayload: Codable, Sendable {
     var text: String
     var width: Int
     var height: Int

@@ -20,6 +20,12 @@ struct AppConfig: Sendable {
     /// `nil` unless `OCR_HTTP_DEBUG_CAPTURE_DIR` is set. Off by default.
     var debugCaptureDir: String?
     var debugCaptureMax: Int
+    /// One recognition (decode + Vision) in a worker; past this the worker is killed.
+    var workerTimeoutMs: Int
+    /// Replace a worker after this many requests.
+    var workerMaxTasks: Int
+    /// Replace an idle worker older than this (wall clock, so it counts sleep).
+    var workerMaxAgeSeconds: Int
 
     static let defaultHosts = ["127.0.0.1"]
     static let defaultPort: UInt16 = 8741
@@ -32,6 +38,9 @@ struct AppConfig: Sendable {
     static let defaultTileMinGlyphFrac = TilePolicy.defaultMinGlyphFrac
     static let defaultOpenAIModel = "mac-ocr"
     static let defaultDebugCaptureMax = 50
+    static let defaultWorkerTimeoutMs = 300_000
+    static let defaultWorkerMaxTasks = 500
+    static let defaultWorkerMaxAgeSeconds = 3600
 
     static func load() throws -> AppConfig {
         let hostArgument = try parseArguments()
@@ -87,6 +96,24 @@ struct AppConfig: Sendable {
             min: 1,
             max: 10_000
         )
+        let workerTimeoutMs = clampedEnv(
+            "OCR_HTTP_WORKER_TIMEOUT_MS",
+            default: defaultWorkerTimeoutMs,
+            min: 5_000,
+            max: 600_000
+        )
+        let workerMaxTasks = clampedEnv(
+            "OCR_HTTP_WORKER_MAX_TASKS",
+            default: defaultWorkerMaxTasks,
+            min: 1,
+            max: 1_000_000
+        )
+        let workerMaxAgeSeconds = clampedEnv(
+            "OCR_HTTP_WORKER_MAX_AGE_S",
+            default: defaultWorkerMaxAgeSeconds,
+            min: 60,
+            max: 7 * 24 * 3600
+        )
         return AppConfig(
             hosts: hosts,
             port: port,
@@ -100,7 +127,10 @@ struct AppConfig: Sendable {
             tileMinGlyphFrac: tileMinGlyphFrac,
             openAIModel: openAIModel,
             debugCaptureDir: debugCaptureDir,
-            debugCaptureMax: debugCaptureMax
+            debugCaptureMax: debugCaptureMax,
+            workerTimeoutMs: workerTimeoutMs,
+            workerMaxTasks: workerMaxTasks,
+            workerMaxAgeSeconds: workerMaxAgeSeconds
         )
     }
 }
@@ -205,7 +235,10 @@ private func printUsage() {
       OCR_HTTP_MAX_BODY_BYTES   Request body cap, 1 MiB...32 MiB (default: \(AppConfig.defaultMaxBodyBytes))
       OCR_HTTP_MAX_PIXELS       Decoded pixel cap, 1000000...200000000 (default: \(AppConfig.defaultMaxPixels))
       OCR_HTTP_MAX_PIXEL        Downscale long edge, 1024...8192 (default: \(AppConfig.defaultMaxPixel))
-      OCR_HTTP_VISION_WORKERS   Serial Vision workers, 1...4 (default: \(AppConfig.defaultVisionWorkers))
+      OCR_HTTP_VISION_WORKERS   Recognition worker processes, 1...4 (default: \(AppConfig.defaultVisionWorkers))
+      OCR_HTTP_WORKER_TIMEOUT_MS  Per-recognition worker deadline, 5000...600000 (default: \(AppConfig.defaultWorkerTimeoutMs))
+      OCR_HTTP_WORKER_MAX_TASKS   Replace a worker after N requests (default: \(AppConfig.defaultWorkerMaxTasks))
+      OCR_HTTP_WORKER_MAX_AGE_S   Replace an idle worker older than N s, 60...604800 (default: \(AppConfig.defaultWorkerMaxAgeSeconds))
       OCR_HTTP_QUEUE_MAX        OCR wait queue, 1...256 (default: \(AppConfig.defaultQueueMax))
       OCR_HTTP_QUEUE_TIMEOUT_MS Queue wait, 1...300000 ms (default: \(AppConfig.defaultQueueTimeoutMs))
       OCR_HTTP_TILE_MIN_GLYPH_FRAC  scale=auto glyph/long-side threshold, 0.001...0.2 (default: \(AppConfig.defaultTileMinGlyphFrac))
